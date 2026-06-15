@@ -1,0 +1,2 @@
+# ccusage - zero required dependencies (pure Python stdlib)
+# Optional: pip install -r requirements.txt for development/testing only
