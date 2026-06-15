@@ -98,8 +98,92 @@ def cmd_report(args: argparse.Namespace) -> int:
             webbrowser.open(url)
         else:
             print(f"   用 --open 自动打开, 或:\n   open '{out_path}'")
+        # 维护 latest.html 软链, 方便快速访问
+        _refresh_latest(out_dir, out_path)
     finally:
         conn.close()
+    return 0
+
+
+def _refresh_latest(out_dir: Path, newest: Path) -> None:
+    """更新 latest.html 软链, 永远指向最新的报告."""
+    latest = out_dir / "latest.html"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(newest.name)
+    except OSError:
+        # 软链失败 (如无权限), 退化为拷贝
+        import shutil
+        shutil.copy2(newest, latest)
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    """一键打开最近一次生成的报告. 可选 --sync 先刷新数据."""
+    db_path = Path(args.db).expanduser()
+    out_dir = Path(args.output).expanduser() if args.output else default_output_dir()
+
+    # 可选: 先同步 + 重新生成
+    if args.fresh:
+        if not db_path.exists():
+            print("⚠️  数据库不存在, 先运行: cc-usage sync", file=sys.stderr)
+            return 1
+        print("🔄 同步最新数据...")
+        conn = connect(db_path)
+        try:
+            sync(conn, default_projects_dir(), verbose=False)
+            dr = resolve_range(args.range)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if args.range == "all":
+                span = date_range_span(conn)
+                tag = f"{span[0]}-to-{span[1]}"
+            else:
+                tag = f"{dr.start}-to-{dr.end}"
+            out_path = out_dir / f"usage-{tag}.html"
+            render_html(conn, dr, out_path)
+            _refresh_latest(out_dir, out_path)
+            print(f"✅ 已刷新: {out_path.name}")
+        finally:
+            conn.close()
+    else:
+        # 直接打开已有的最新报告
+        htmls = sorted(
+            out_dir.glob("usage-*.html"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not htmls:
+            print("📂 还没有任何报告, 正在生成首份...")
+            if not db_path.exists():
+                cmd_sync(argparse.Namespace(
+                    db=args.db, force=False,
+                    projects_dir=str(default_projects_dir()),
+                ))
+            conn = connect(db_path)
+            try:
+                dr = resolve_range("all")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                span = date_range_span(conn)
+                out_path = out_dir / f"usage-{span[0]}-to-{span[1]}.html"
+                render_html(conn, dr, out_path)
+                _refresh_latest(out_dir, out_path)
+            finally:
+                conn.close()
+            htmls = [out_path]
+
+        target = htmls[0]
+        url = target.resolve().as_uri()
+        age_min = (Path(target).stat().st_mtime,)
+        import time
+        age = time.time() - Path(target).stat().st_mtime
+        age_str = (
+            f"{int(age // 60)} 分钟前" if age < 3600
+            else f"{int(age // 3600)} 小时前" if age < 86400
+            else f"{int(age // 86400)} 天前"
+        )
+        print(f"🚀 打开: {target.name}  (生成于 {age_str})")
+        webbrowser.open(url)
+        print(f"   💡 想要最新数据? 用: cc-usage open --fresh")
     return 0
 
 
@@ -162,6 +246,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--output", "-o", help="输出目录")
     sp.add_argument("--open", action="store_true", help="生成后用浏览器打开")
     sp.set_defaults(func=cmd_report)
+
+    # open (一键打开最近报告)
+    sp = sub.add_parser("open", help="一键打开最近一次的 HTML 报告")
+    sp.add_argument("--fresh", action="store_true", help="先同步数据并重新生成")
+    sp.add_argument(
+        "--range", "-r",
+        choices=["today", "week", "month", "all"],
+        default="all",
+    )
+    sp.add_argument("--output", "-o", help="输出目录")
+    sp.set_defaults(func=cmd_open)
 
     # status
     sp = sub.add_parser("status", help="查看数据库状态")

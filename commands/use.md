@@ -10,8 +10,10 @@ description: 查看 Claude Code 用量统计 (token by model)
 - `month` → 执行 `cc-usage month`，展示本月统计
 - `report` → 执行 `cc-usage report --range week --open`，生成炫酷的 HTML 报告并用浏览器打开；告诉用户文件路径
 - `report month` / `report all` → 执行 `cc-usage report --range month --open` 或 `--range all --open`
+- `open` → 执行 `cc-usage open`，一键秒开最近一次的 HTML 报告（不重新生成）
+- `open fresh` 或 `open --fresh` → 执行 `cc-usage open --fresh`，先同步最新数据再打开
 - `sync` → 执行 `cc-usage sync`，刷新数据库
-- 其他无法识别的参数 → 提示支持的用法：`/use [today|week|month|report [today|week|month|all]|sync]`
+- 其他无法识别的参数 → 提示支持的用法：`/use [today|week|month|open [fresh]|report [today|week|month|all]|sync]`
 
 注意：
 1. 如果提示「数据库不存在」或「⚠️」，先静默执行一次 `cc-usage sync`（首次约 10 秒），然后再执行用户原本要的命令。
