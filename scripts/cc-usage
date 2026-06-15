@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # cc-usage 全局入口 - 通过 python -m 调用 ccusage 包.
-# 安装: 把本文件软链到 /usr/local/bin/cc-usage
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 必须解析软链, 找到真实的项目根目录, 否则从其他 cwd 运行会找不到包.
+set -e
+
+SOURCE="${BASH_SOURCE[0]}"
+# 顺着软链一路解析到真实文件
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# 让 python 能找到 ccusage 包 (无论当前 cwd 在哪)
+export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
 exec python3 -m ccusage.cli "$@"
