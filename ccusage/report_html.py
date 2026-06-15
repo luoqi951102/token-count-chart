@@ -203,6 +203,8 @@ def render(
         "range_label": dr.label,
         "range_start": dr.start,
         "range_end": dr.end,
+        "data_start": data_span[0] or dr.start,
+        "data_end": data_span[1] or dr.end,
         "generated_at": now_in_sh().strftime("%Y-%m-%d %H:%M:%S"),
         "data_span": f"{data_span[0]} ~ {data_span[1]}" if data_span[0] else "N/A",
         "kpi": {
@@ -268,6 +270,8 @@ def _build_html(p: dict) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{title}</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <style>
   :root {{
     --bg: #07070d;
@@ -524,6 +528,142 @@ def _build_html(p: dict) -> str:
     border-top: 1px solid var(--card-border);
     margin-top: 30px;
   }}
+
+  /* ===== 导出按钮 (玻璃拟态, 与卡片统一) ===== */
+  .actions {{
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    margin-top: 26px;
+    flex-wrap: wrap;
+  }}
+  .btn {{
+    position: relative;
+    padding: 12px 24px;
+    border-radius: 14px;
+    border: 1px solid var(--card-border);
+    background: var(--card);
+    backdrop-filter: blur(20px);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    overflow: hidden;
+    transition: transform .25s cubic-bezier(.34,1.56,.64,1),
+                border-color .25s, box-shadow .3s;
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    letter-spacing: 0.3px;
+  }}
+  .btn::before {{
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--bgrad);
+  }}
+  .btn::after {{
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: var(--bgrad);
+    opacity: 0;
+    transition: opacity .3s;
+    z-index: -1;
+  }}
+  .btn:hover {{
+    transform: translateY(-3px);
+    border-color: rgba(255,255,255,0.2);
+    box-shadow: 0 10px 32px var(--bshadow);
+  }}
+  .btn:hover::after {{ opacity: 0.08; }}
+  .btn:active {{ transform: translateY(-1px); }}
+  .btn:disabled {{
+    opacity: 0.55;
+    cursor: progress;
+    transform: none !important;
+    box-shadow: none !important;
+  }}
+  .btn .icon {{
+    font-size: 15px;
+    filter: drop-shadow(0 0 6px var(--bshadow));
+  }}
+  .btn .label {{
+    background: var(--bgrad);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }}
+  .btn-png {{
+    --bgrad: linear-gradient(135deg, #a78bfa 0%, #f472b6 100%);
+    --bshadow: rgba(167,139,250,0.35);
+  }}
+  .btn-pdf {{
+    --bgrad: linear-gradient(135deg, #22d3ee 0%, #60a5fa 100%);
+    --bshadow: rgba(34,211,238,0.35);
+  }}
+  .btn .spinner {{
+    width: 13px; height: 13px;
+    border: 2px solid rgba(255,255,255,0.15);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    display: inline-block;
+  }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+  /* ===== 导出时的全局 loading overlay ===== */
+  #export-overlay {{
+    position: fixed;
+    inset: 0;
+    background: rgba(7,7,13,0.78);
+    backdrop-filter: blur(10px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    flex-direction: column;
+    gap: 18px;
+  }}
+  #export-overlay.show {{ display: flex; }}
+  #export-overlay .ring {{
+    width: 44px; height: 44px;
+    border: 3px solid rgba(167,139,250,0.15);
+    border-top-color: #a78bfa;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }}
+  #export-overlay .text {{
+    color: var(--text-dim);
+    font-size: 14px;
+    letter-spacing: 0.5px;
+  }}
+
+  /* ===== Toast 提示 ===== */
+  #toast {{
+    position: fixed;
+    bottom: 32px;
+    left: 50%;
+    transform: translateX(-50%) translateY(120px);
+    background: rgba(20,20,35,0.95);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 13px 26px;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 600;
+    opacity: 0;
+    transition: transform .35s cubic-bezier(.34,1.56,.64,1), opacity .35s;
+    z-index: 10000;
+    backdrop-filter: blur(20px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  }}
+  #toast.show {{
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }}
   footer code {{
     background: rgba(255,255,255,0.06);
     padding: 2px 8px;
@@ -541,6 +681,14 @@ def _build_html(p: dict) -> str:
     <h1>{title}</h1>
     <div class="meta">
       数据范围 <b id="m-span"></b> · 生成于 <b id="m-gen"></b> · Asia/Shanghai
+    </div>
+    <div class="actions">
+      <button id="btn-png" class="btn btn-png" type="button">
+        <span class="icon">📸</span><span class="label">导出 PNG</span>
+      </button>
+      <button id="btn-pdf" class="btn btn-pdf" type="button">
+        <span class="icon">📄</span><span class="label">导出 PDF</span>
+      </button>
     </div>
   </div>
 
@@ -621,6 +769,12 @@ def _build_html(p: dict) -> str:
     Generated by <code>cc-usage</code> · 数据来自 <code>~/.claude/projects</code>
   </footer>
 </div>
+
+<div id="export-overlay">
+  <div class="ring"></div>
+  <div class="text" id="export-text">正在渲染, 请稍候...</div>
+</div>
+<div id="toast"></div>
 
 <script>
 const P = {payload_json};
@@ -974,6 +1128,137 @@ document.querySelectorAll('.kpi .value').forEach((el, i) => {{
     </tr>
   `;
 }})();
+
+// ============ 导出 PNG / PDF ============
+const exportOverlay = document.getElementById('export-overlay');
+const exportText = document.getElementById('export-text');
+const toastEl = document.getElementById('toast');
+
+function showToast(msg) {{
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toastEl.classList.remove('show'), 2800);
+}}
+
+function safeName() {{
+  const s = (P.data_start || P.range_start || '').replace(/[^0-9]/g, '');
+  const e = (P.data_end || P.range_end || '').replace(/[^0-9]/g, '');
+  return `cc-usage-${{s}}-to-${{e}}`;
+}}
+
+// 把渐变文字临时换成实色, 避免 html2canvas 渲染丢失
+function fixGradientText(on) {{
+  const els = document.querySelectorAll('h1, .kpi .value, .btn .label');
+  els.forEach(el => {{
+    if (on) {{
+      el.dataset.fill = el.style.webkitTextFillColor || '';
+      el.style.webkitTextFillColor = 'currentColor';
+      el.style.color = '#a78bfa';
+    }} else {{
+      el.style.webkitTextFillColor = el.dataset.fill || '';
+      el.style.color = '';
+    }}
+  }});
+}}
+
+async function capturePage() {{
+  exportOverlay.classList.add('show');
+  // 隐藏导出按钮自身 + footer, 避免出现在图里
+  document.querySelector('.actions').style.visibility = 'hidden';
+  fixGradientText(true);
+  await new Promise(r => requestAnimationFrame(r));
+  await new Promise(r => setTimeout(r, 80));
+
+  try {{
+    const target = document.querySelector('.wrap');
+    const canvas = await html2canvas(target, {{
+      backgroundColor: '#07070d',
+      scale: 2,
+      useCORS: true,
+      allowTaint: false,
+      logging: false,
+      windowWidth: target.scrollWidth,
+      width: target.scrollWidth,
+      height: target.scrollHeight,
+    }});
+    return canvas;
+  }} finally {{
+    fixGradientText(false);
+    document.querySelector('.actions').style.visibility = '';
+    exportOverlay.classList.remove('show');
+  }}
+}}
+
+async function exportPNG() {{
+  const btn = document.getElementById('btn-png');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span><span class="label">渲染中...</span>';
+  exportText.textContent = '正在生成 PNG...';
+  try {{
+    const canvas = await capturePage();
+    canvas.toBlob(blob => {{
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = safeName() + '.png';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast('✅ PNG 已下载');
+    }}, 'image/png');
+  }} catch (e) {{
+    console.error(e);
+    showToast('❌ 导出失败: ' + (e.message || e));
+  }} finally {{
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }}
+}}
+
+async function exportPDF() {{
+  const btn = document.getElementById('btn-pdf');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span><span class="label">渲染中...</span>';
+  exportText.textContent = '正在生成 PDF...';
+  try {{
+    const canvas = await capturePage();
+    const {{ jsPDF }} = window.jspdf;
+    // A4 纵向, 按宽度铺满, 自动分页
+    const pdf = new jsPDF({{ orientation: 'p', unit: 'mm', format: 'a4' }});
+    const pageW = pdf.internal.pageSize.getWidth();   // 210
+    const pageH = pdf.internal.pageSize.getHeight();  // 297
+    const imgH = (canvas.height * pageW) / canvas.width;
+    const imgData = canvas.toDataURL('image/png');
+
+    let heightLeft = imgH;
+    let position = 0;
+    pdf.addImage(imgData, 'PNG', 0, position, pageW, imgH, undefined, 'FAST');
+    heightLeft -= pageH;
+    while (heightLeft > 0) {{
+      position -= pageH;
+      pdf.addPage();
+      pdf.addImage(imgData, 'PNG', 0, position, pageW, imgH, undefined, 'FAST');
+      heightLeft -= pageH;
+    }}
+    pdf.save(safeName() + '.pdf');
+    showToast('✅ PDF 已下载');
+  }} catch (e) {{
+    console.error(e);
+    showToast('❌ 导出失败: ' + (e.message || e));
+  }} finally {{
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }}
+}}
+
+document.getElementById('btn-png').addEventListener('click', exportPNG);
+document.getElementById('btn-pdf').addEventListener('click', exportPDF);
 </script>
 </body>
 </html>
