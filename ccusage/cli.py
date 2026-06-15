@@ -119,12 +119,15 @@ def _refresh_latest(out_dir: Path, newest: Path) -> None:
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    """一键打开最近一次生成的报告. 可选 --sync 先刷新数据."""
+    """一键打开最近一次生成的报告. 可选 --fresh 先刷新数据."""
+    import time
+
     db_path = Path(args.db).expanduser()
     out_dir = Path(args.output).expanduser() if args.output else default_output_dir()
+    target: Path | None = None
 
-    # 可选: 先同步 + 重新生成
     if args.fresh:
+        # 同步 + 重新生成
         if not db_path.exists():
             print("⚠️  数据库不存在, 先运行: cc-usage sync", file=sys.stderr)
             return 1
@@ -139,10 +142,10 @@ def cmd_open(args: argparse.Namespace) -> int:
                 tag = f"{span[0]}-to-{span[1]}"
             else:
                 tag = f"{dr.start}-to-{dr.end}"
-            out_path = out_dir / f"usage-{tag}.html"
-            render_html(conn, dr, out_path)
-            _refresh_latest(out_dir, out_path)
-            print(f"✅ 已刷新: {out_path.name}")
+            target = out_dir / f"usage-{tag}.html"
+            render_html(conn, dr, target)
+            _refresh_latest(out_dir, target)
+            print(f"✅ 已刷新: {target.name}")
         finally:
             conn.close()
     else:
@@ -164,25 +167,25 @@ def cmd_open(args: argparse.Namespace) -> int:
                 dr = resolve_range("all")
                 out_dir.mkdir(parents=True, exist_ok=True)
                 span = date_range_span(conn)
-                out_path = out_dir / f"usage-{span[0]}-to-{span[1]}.html"
-                render_html(conn, dr, out_path)
-                _refresh_latest(out_dir, out_path)
+                target = out_dir / f"usage-{span[0]}-to-{span[1]}.html"
+                render_html(conn, dr, target)
+                _refresh_latest(out_dir, target)
             finally:
                 conn.close()
-            htmls = [out_path]
+        else:
+            target = htmls[0]
 
-        target = htmls[0]
-        url = target.resolve().as_uri()
-        age_min = (Path(target).stat().st_mtime,)
-        import time
-        age = time.time() - Path(target).stat().st_mtime
-        age_str = (
-            f"{int(age // 60)} 分钟前" if age < 3600
-            else f"{int(age // 3600)} 小时前" if age < 86400
-            else f"{int(age // 86400)} 天前"
-        )
-        print(f"🚀 打开: {target.name}  (生成于 {age_str})")
-        webbrowser.open(url)
+    # 两条路径都汇合到这里: 打开浏览器
+    url = target.resolve().as_uri()
+    age = time.time() - target.stat().st_mtime
+    age_str = (
+        f"{int(age // 60)} 分钟前" if age < 3600
+        else f"{int(age // 3600)} 小时前" if age < 86400
+        else f"{int(age // 86400)} 天前"
+    )
+    print(f"🚀 打开: {target.name}  (生成于 {age_str})")
+    webbrowser.open(url)
+    if not args.fresh:
         print(f"   💡 想要最新数据? 用: cc-usage open --fresh")
     return 0
 
