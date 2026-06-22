@@ -251,3 +251,128 @@ def active_projects(
             name = cwd
         out.append({"project": name, "total": total or 0, "msgs": msgs or 0})
     return out
+
+
+# ---------- 游戏化指标 ----------
+
+
+def streak(conn: sqlite3.Connection) -> dict:
+    """连续打卡天数.
+
+    current: 从今天往前数的连续天数 (今天没数据则从昨天起算, 更友好);
+    longest: 历史最长连续; active_today: 今天是否有用量.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT local_date FROM usage ORDER BY local_date"
+    ).fetchall()
+    dates = sorted(r[0] for r in rows)
+    if not dates:
+        return {"current": 0, "longest": 0, "active_today": False}
+
+    date_set = set(dates)
+    today = now_in_sh().date()
+    today_str = today.strftime("%Y-%m-%d")
+    active_today = today_str in date_set
+
+    # current: 若今天没用, 从昨天起算 (深夜看不会是 0)
+    cursor = today if active_today else today - timedelta(days=1)
+    current = 0
+    while cursor.strftime("%Y-%m-%d") in date_set:
+        current += 1
+        cursor -= timedelta(days=1)
+
+    # longest: 扫排序日期, 找最长连续段
+    longest = 0
+    run = 0
+    prev = None
+    for d in dates:
+        dt = datetime.strptime(d, "%Y-%m-%d").date()
+        if prev is not None and (dt - prev).days == 1:
+            run += 1
+        else:
+            run = 1
+        longest = max(longest, run)
+        prev = dt
+
+    return {"current": current, "longest": longest, "active_today": active_today}
+
+
+def weekday_vs_weekend(
+    conn: sqlite3.Connection, start: str, end: str
+) -> dict:
+    """工作日 vs 周末的用量对比 (total + 覆盖天数).
+
+    strftime('%w', 'YYYY-MM-DD'): 0=周日, 6=周六.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            CASE WHEN strftime('%w', local_date) IN ('0','6')
+                 THEN 'weekend' ELSE 'weekday' END AS kind,
+            SUM(total_context),
+            COUNT(DISTINCT local_date)
+        FROM usage
+        WHERE local_date BETWEEN ? AND ?
+        GROUP BY kind
+        """,
+        (start, end),
+    ).fetchall()
+    res = {
+        "weekday": {"total": 0, "days": 0},
+        "weekend": {"total": 0, "days": 0},
+    }
+    for kind, total, days in rows:
+        if kind in res:
+            res[kind]["total"] = total or 0
+            res[kind]["days"] = days or 0
+    return res
+
+
+def peak_day(conn: sqlite3.Connection, start: str, end: str) -> dict | None:
+    """区间内用量最大的那一天. 无数据返回 None."""
+    row = conn.execute(
+        """
+        SELECT local_date, SUM(total_context), SUM(msg_count)
+        FROM usage
+        WHERE local_date BETWEEN ? AND ?
+        GROUP BY local_date
+        ORDER BY SUM(total_context) DESC
+        LIMIT 1
+        """,
+        (start, end),
+    ).fetchone()
+    if not row or not row[1]:
+        return None
+    return {"date": row[0], "total": row[1], "msgs": row[2] or 0}
+
+
+def week_over_week(conn: sqlite3.Connection) -> dict:
+    """本周 vs 上周总量环比. delta_pct: 涨跌百分比 (上周为 0 则 None)."""
+    this = resolve_range("week")
+    last_start = (
+        datetime.strptime(this.start, "%Y-%m-%d") - timedelta(days=7)
+    ).strftime("%Y-%m-%d")
+    last_end = (
+        datetime.strptime(this.end, "%Y-%m-%d") - timedelta(days=7)
+    ).strftime("%Y-%m-%d")
+
+    def _sum(s: str, e: str) -> int:
+        r = conn.execute(
+            "SELECT COALESCE(SUM(total_context), 0) FROM usage "
+            "WHERE local_date BETWEEN ? AND ?",
+            (s, e),
+        ).fetchone()
+        return r[0] or 0
+
+    this_week = _sum(this.start, this.end)
+    last_week = _sum(last_start, last_end)
+    delta_pct = (
+        round((this_week - last_week) / last_week * 100, 1) if last_week else None
+    )
+    return {
+        "this_week": this_week,
+        "last_week": last_week,
+        "last_start": last_start,
+        "last_end": last_end,
+        "delta_pct": delta_pct,
+    }
