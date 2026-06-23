@@ -10,7 +10,7 @@
 
 - 📊 **多维统计**：每个模型每日的 input / cache_write / cache_read / output / 总上下文 / 消息数
 - 📅 **多时间窗**：今日 / 本周 / 本月 / 全部历史
-- 🎨 **炫酷 HTML 仪表盘**：日历热力图、堆叠柱状图、环形饼图、趋势折线、周对比、雷达图、项目排行
+- 🎨 **炫酷 HTML 仪表盘**：7 图表 + Hero 超大 count-up + 滚动入场动效 + 游戏化指标(连续打卡 / 周环比 / 工作日周末 / 最卷一天)+ 前端 today/week/month/all 一键切换 + 明暗主题 + 模型聚焦
 - ⚡ **增量同步**：首次 ~2 秒解析全量，之后每次 <1 秒（按文件 mtime 去重）
 - 🌏 **时区正确**：UTC 时间戳转 Asia/Shanghai 后再按天分桶
 - 💻 **终端彩色输出**：ANSI 表格 + 进度条
@@ -19,7 +19,15 @@
 
 ## 🚀 快速开始
 
-### 1. 全局安装（软链）
+### 方式一：一键安装（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoqi951102/token-count-chart/main/install.sh | bash
+```
+
+装完重开终端（或 `source ~/.zshrc`），然后 `cc-usage sync` 同步数据、`ccuf` 一键打开报告。卸载：`bash ~/.cc-usage/uninstall.sh`。升级：重跑同一条 curl 命令即可。
+
+### 方式二：手动软链
 
 ```bash
 git clone <repo> ~/work/token-count
