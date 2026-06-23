@@ -75,6 +75,7 @@ function buildCalendar() {
   const c = themeColors();
   const values = P.calendar.map(d => d.value);
   const max = Math.max(...values, 1);
+  const calDates = P.calendar.map(d => d.name).sort();
   return {
     tooltip: Object.assign({}, tooltip(), {
       formatter: p => `<b>${p.value[0]}</b><br/>总用量: <b style="color:#a78bfa">${fmtTok(p.value[1])}</b><br/>${fmtNum(p.value[1])} tokens`
@@ -86,7 +87,7 @@ function buildCalendar() {
     },
     calendar: {
       top: 30, left: 60, right: 30, cellSize: ['auto', 16],
-      range: P.calendar.map(d => d.name),
+      range: calDates.length ? [calDates[0], calDates[calDates.length - 1]] : [],
       itemStyle: { borderWidth: 2, borderColor: c.calBorder, color: c.calEmpty },
       yearLabel: { show: false }, dayLabel: { color: c.dim, fontSize: 10 },
       monthLabel: { color: c.dim, fontSize: 11 }, splitLine: { show: false }
