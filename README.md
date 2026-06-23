@@ -19,7 +19,15 @@
 
 ## 🚀 快速开始
 
-### 1. 全局安装（软链）
+### 方式一：一键安装（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoqi951102/token-count-chart/main/install.sh | bash
+```
+
+装完重开终端（或 `source ~/.zshrc`），然后 `cc-usage sync` 同步数据、`ccuf` 一键打开报告。卸载：`bash ~/.cc-usage/uninstall.sh`。升级：重跑同一条 curl 命令即可。
+
+### 方式二：手动软链
 
 ```bash
 git clone <repo> ~/work/token-count
