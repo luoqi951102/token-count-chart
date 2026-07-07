@@ -11,7 +11,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 SH = ZoneInfo("Asia/Shanghai")
-RangeKey = Literal["today", "week", "month", "all"]
+RangeKey = Literal["today", "week", "last_week", "month", "all"]
 
 
 @dataclass
@@ -30,7 +30,7 @@ def now_in_sh() -> datetime:
 
 
 def resolve_range(rng: RangeKey | str) -> DateRange:
-    """把 today/week/month/all 解析成具体的日期区间."""
+    """把 today/week/last_week/month/all 解析成具体的日期区间."""
     today = now_in_sh()
     if rng == "today":
         d = today.strftime("%Y-%m-%d")
@@ -42,6 +42,15 @@ def resolve_range(rng: RangeKey | str) -> DateRange:
             monday.strftime("%Y-%m-%d"),
             sunday.strftime("%Y-%m-%d"),
             f"本周 {monday.strftime('%m-%d')} ~ {sunday.strftime('%m-%d')}",
+        )
+    if rng == "last_week":
+        this_monday = today - timedelta(days=today.weekday())
+        monday = this_monday - timedelta(days=7)
+        sunday = monday + timedelta(days=6)
+        return DateRange(
+            monday.strftime("%Y-%m-%d"),
+            sunday.strftime("%Y-%m-%d"),
+            f"上周 {monday.strftime('%m-%d')} ~ {sunday.strftime('%m-%d')}",
         )
     if rng == "month":
         first = today.replace(day=1)
