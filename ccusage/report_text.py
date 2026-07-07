@@ -12,6 +12,7 @@ from .aggregate import (
     date_range_span,
     hourly_distribution,
     now_in_sh,
+    source_breakdown,
 )
 
 
@@ -61,8 +62,8 @@ def model_color(model: str, idx: int) -> str:
     return _MODEL_COLORS[idx % len(_MODEL_COLORS)]
 
 
-def render(conn: sqlite3.Connection, dr: DateRange) -> str:
-    """渲染一个区间的终端报告."""
+def render(conn: sqlite3.Connection, dr: DateRange, source: str = "all") -> str:
+    """渲染一个区间的终端报告. source 可选过滤 'claude'/'zcode'."""
     out = []
 
     # 标题
@@ -70,7 +71,8 @@ def render(conn: sqlite3.Connection, dr: DateRange) -> str:
     out.append(
         f"{C.BOLD}{C.BCYAN}╭─────────────────────────────────────────────────╮{C.RESET}"
     )
-    title = f"Claude Code 用量 · {dr.label}"
+    src_tag = {"all": "全部", "claude": "Claude", "zcode": "ZCode"}.get(source, source)
+    title = f"Claude/ZCode 用量 · {dr.label} · {src_tag}"
     out.append(
         f"{C.BOLD}{C.BCYAN}│ {C.BMAGENTA}{title:<47}{C.BCYAN}│{C.RESET}"
     )
@@ -82,11 +84,20 @@ def render(conn: sqlite3.Connection, dr: DateRange) -> str:
             f"{C.DIM}  区间: {dr.start} ~ {dr.end}"
             f"  ·  时区: Asia/Shanghai{C.RESET}"
         )
+    # 占比标注 (仅 source=all 时显示)
+    if source == "all":
+        bk = source_breakdown(conn, dr.start, dr.end)
+        tot_bk = bk["claude"] + bk["zcode"]
+        if tot_bk:
+            cp = bk["claude"] / tot_bk * 100
+            out.append(
+                f"{C.DIM}  来源: Claude {cp:.0f}% · ZCode {100 - cp:.0f}%{C.RESET}"
+            )
     out.append("")
 
     # 拉数据
-    models = by_model(conn, dr.start, dr.end)
-    daily = daily_totals(conn, dr.start, dr.end)
+    models = by_model(conn, dr.start, dr.end, source)
+    daily = daily_totals(conn, dr.start, dr.end, source)
     if not models:
         out.append(f"{C.DIM}  该区间内暂无数据.{C.RESET}")
         out.append("")

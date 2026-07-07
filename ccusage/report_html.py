@@ -28,6 +28,7 @@ from .aggregate import (
     now_in_sh,
     peak_day,
     resolve_range,
+    source_breakdown,
     streak,
     weekday_vs_weekend,
     weekly_by_model,
@@ -53,17 +54,20 @@ def model_color_map(models: list[str]) -> dict[str, str]:
     return {m: PALETTE[i % len(PALETTE)] for i, m in enumerate(sorted(models))}
 
 
-def _build_range(conn: sqlite3.Connection, dr: DateRange, cmap: dict[str, str]) -> dict:
-    """为一个 DateRange 跑全部聚合, 组装成前端同构结构.
+def _build_range(
+    conn: sqlite3.Connection, dr: DateRange, cmap: dict[str, str],
+    source: str = "all",
+) -> dict:
+    """为一个 (DateRange, source) 跑全部聚合, 组装成前端同构结构.
 
     daily/weekly series 用 dict 预索引取值 (修原 O(N^2) 嵌套扫描).
     """
-    model_rows = by_model(conn, dr.start, dr.end)
-    daily_rows = daily_by_model(conn, dr.start, dr.end)
-    daily_total_rows = daily_totals(conn, dr.start, dr.end)
-    weekly_rows = weekly_by_model(conn, dr.start, dr.end)
-    hourly_rows = hourly_distribution(conn, dr.start, dr.end)
-    projects = active_projects(conn, dr.start, dr.end, limit=8)
+    model_rows = by_model(conn, dr.start, dr.end, source)
+    daily_rows = daily_by_model(conn, dr.start, dr.end, source)
+    daily_total_rows = daily_totals(conn, dr.start, dr.end, source)
+    weekly_rows = weekly_by_model(conn, dr.start, dr.end, source)
+    hourly_rows = hourly_distribution(conn, dr.start, dr.end, source)
+    projects = active_projects(conn, dr.start, dr.end, limit=8, source=source)
 
     # 用全局模型顺序配色, 保证切 range 时同一模型颜色不变
     models_in_range = sorted(cmap.keys())
@@ -156,42 +160,59 @@ def _infer_range_key(dr: DateRange) -> str:
     return "week"
 
 
-def render(conn: sqlite3.Connection, dr: DateRange, output_path: Path) -> Path:
-    """生成 HTML 报告, 返回文件路径."""
-    # 全局配色: 基于全量模型, 跨 range 稳定
+_RANGE_KEYS = ("today", "week", "last_week", "month", "all")
+_SOURCE_KEYS = ("all", "claude", "zcode")
+
+
+def render(
+    conn: sqlite3.Connection, dr: DateRange, output_path: Path,
+    source: str = "all",
+) -> Path:
+    """生成 HTML 报告, 返回文件路径.
+
+    source: 报告初始高亮的来源 ('all'/'claude'/'zcode'). 前端三个 source 都可切.
+    """
+    # 全局配色: 基于全量 (all source) 模型, 跨 source/range 稳定
     all_model_rows = by_model(conn, _ALL_START, _ALL_END)
     all_models = sorted({m["model"] for m in all_model_rows})
     cmap = model_color_map(all_models)
 
-    # 全量日历热力图 + 近 14 天 sparkline (不随 range 变)
-    all_daily = daily_totals(conn, _ALL_START, _ALL_END)
-    calendar_data = [{"name": d["date"], "value": d["total"]} for d in all_daily]
-    sparkline = calendar_data[-14:]
+    # 日历热力图 + sparkline: 每个 source 一份 (前端切 source 时日历也跟着变)
+    calendars = {}
+    sparklines = {}
+    for sk in _SOURCE_KEYS:
+        daily = daily_totals(conn, _ALL_START, _ALL_END, sk)
+        cd = [{"name": d["date"], "value": d["total"]} for d in daily]
+        calendars[sk] = cd
+        sparklines[sk] = cd[-14:]
 
-    # 5 range 预计算 (前端切 range 只换数据源, 零聚合)
+    # ranges: 按 source × range 预计算 (前端切 source/range 都是零聚合换数据源)
     ranges = {
-        key: _build_range(conn, resolve_range(key), cmap)
-        for key in ("today", "week", "last_week", "month", "all")
+        sk: {rk: _build_range(conn, resolve_range(rk), cmap, sk) for rk in _RANGE_KEYS}
+        for sk in _SOURCE_KEYS
     }
 
-    # 游戏化指标 (全量, 与 range 无关)
-    gamification = {
-        "streak": streak(conn),
-        "wow": week_over_week(conn),
-        "weekday_weekend": weekday_vs_weekend(conn, _ALL_START, _ALL_END),
-        "peak": peak_day(conn, _ALL_START, _ALL_END),
-    }
+    # 游戏化指标: 每个 source 一份 (切到 zcode 时打卡/环比应是 zcode 自己的)
+    gamification = {}
+    for sk in _SOURCE_KEYS:
+        gamification[sk] = {
+            "streak": streak(conn),
+            "wow": week_over_week(conn),
+            "weekday_weekend": weekday_vs_weekend(conn, _ALL_START, _ALL_END),
+            "peak": peak_day(conn, _ALL_START, _ALL_END, sk),
+        }
 
     span = date_range_span(conn)
     payload = {
         "range_default": _infer_range_key(dr),
+        "source_default": source if source in _SOURCE_KEYS else "all",
         "range_start": dr.start,
         "range_end": dr.end,
         "data_start": span[0] or dr.start,
         "data_end": span[1] or dr.end,
         "generated_at": now_in_sh().strftime("%Y-%m-%d %H:%M:%S"),
-        "calendar": calendar_data,
-        "sparkline": sparkline,
+        "calendars": calendars,
+        "sparklines": sparklines,
         "gamification": gamification,
         "models": all_models,
         "colors": cmap,
@@ -209,7 +230,11 @@ def render(conn: sqlite3.Connection, dr: DateRange, output_path: Path) -> Path:
 
 def _build_html(p: dict) -> str:
     payload_json = json.dumps(p, ensure_ascii=False)
-    title = html.escape(f"Claude Code 用量 · {p['ranges'][p['range_default']]['label']}")
+    sd = p["source_default"]
+    rd = p["range_default"]
+    title = html.escape(
+        f"Claude Code / ZCode 用量 · {p['ranges'][sd][rd]['label']}"
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN" data-theme="dark">
@@ -229,7 +254,7 @@ def _build_html(p: dict) -> str:
 <div class="wrap">
 
   <header class="hero reveal">
-    <div class="badge">◆ CLAUDE CODE USAGE</div>
+    <div class="badge">◆ CLAUDE CODE / ZCODE USAGE</div>
     <h1>{title}</h1>
     <div class="meta">数据范围 <b id="m-span"></b> · 生成于 <b id="m-gen"></b> · Asia/Shanghai</div>
     <div class="hero-stats">
@@ -242,6 +267,11 @@ def _build_html(p: dict) -> str:
       <div class="hero-pulse"><span class="pulse-dot"></span><span id="hero-pulse-text">连续打卡</span></div>
     </div>
     <div class="toolbar">
+      <div class="source-tabs" id="source-tabs">
+        <button type="button" data-source="all">全部</button>
+        <button type="button" data-source="claude">Claude</button>
+        <button type="button" data-source="zcode">ZCode</button>
+      </div>
       <div class="range-tabs" id="range-tabs">
         <button type="button" data-range="today">今日</button>
         <button type="button" data-range="week">本周</button>

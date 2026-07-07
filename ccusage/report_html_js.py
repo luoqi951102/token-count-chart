@@ -2,8 +2,10 @@
 
 由 report_html._build_html 拼接进 <script>, 前面已有 `const P = {...}`.
 架构:
-- 数据源: P.ranges[today|week|month|all], 每个 range 同构 (kpi/daily/pie/...)
-- 切 range = 换数据源 + 所有图表 setOption(opt, true) 重绘 + count-up 重触发
+- 数据源: P.ranges[source][range], source∈{all,claude,zcode}, range∈{today,week,last_week,month,all}
+  每个组合同构 (kpi/daily/pie/...). 切 range 或 source 都是零聚合换数据源.
+- P.calendars[source] / P.sparklines[source] / P.gamification[source] 同理.
+- 切换 = 所有图表 setOption(opt, true) 重绘 + count-up 重触发
 - 主题: 读 CSS 变量 (themeColors), 切主题重绘图表配色
 - count-up / reveal / 鼠标视差 / 导出兼容 (forceFinalState)
 """
@@ -12,8 +14,12 @@ JS = r"""
 const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const charts = {};
 let currentRange = P.range_default || 'week';
+let currentSource = P.source_default || 'all';
 let focusedModel = null;
 let exporting = false;
+
+// 取当前 source 下的 range 数据 (二维: ranges[source][rangeKey])
+function rangeData() { return P.ranges[currentSource][currentRange]; }
 
 // ============ 格式化 ============
 function fmtTok(n) {
@@ -71,11 +77,12 @@ function animateCount(el, raw, fmt) {
 
 // ============ 图表 option 构造 ============
 function buildCalendar() {
-  if (!P.calendar.length) return null;
+  const cal = P.calendars[currentSource] || [];
+  if (!cal.length) return null;
   const c = themeColors();
-  const values = P.calendar.map(d => d.value);
+  const values = cal.map(d => d.value);
   const max = Math.max(...values, 1);
-  const calDates = P.calendar.map(d => d.name).sort();
+  const calDates = cal.map(d => d.name).sort();
   return {
     tooltip: Object.assign({}, tooltip(), {
       formatter: p => `<b>${p.value[0]}</b><br/>总用量: <b style="color:#a78bfa">${fmtTok(p.value[1])}</b><br/>${fmtNum(p.value[1])} tokens`
@@ -94,7 +101,7 @@ function buildCalendar() {
     },
     series: [{
       type: 'heatmap', coordinateSystem: 'calendar',
-      data: P.calendar.map(d => [d.name, d.value]), progressive: 2000
+      data: cal.map(d => [d.name, d.value]), progressive: 2000
     }]
   };
 }
@@ -286,15 +293,16 @@ function renderTable(r) {
 
 function renderSparkline() {
   const dom = document.getElementById('spark');
-  if (!dom || !P.sparkline.length) return;
+  const spark = P.sparklines[currentSource] || [];
+  if (!dom || !spark.length) { if (dom) dom.innerHTML = ''; return; }
   if (!charts.spark) charts.spark = echarts.init(dom);
   charts.spark.setOption({
     grid: { left: 0, right: 0, top: 4, bottom: 0 },
-    xAxis: { type: 'category', show: false, boundaryGap: false, data: P.sparkline.map(d => d.name) },
+    xAxis: { type: 'category', show: false, boundaryGap: false, data: spark.map(d => d.name) },
     yAxis: { type: 'value', show: false },
     tooltip: { show: false },
     series: [{
-      type: 'line', smooth: true, symbol: 'none', data: P.sparkline.map(d => d.value),
+      type: 'line', smooth: true, symbol: 'none', data: spark.map(d => d.value),
       lineStyle: { width: 2.5, color: '#a78bfa' },
       areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(167,139,250,0.50)' }, { offset: 1, color: 'rgba(167,139,250,0.02)' }]) }
     }]
@@ -309,7 +317,7 @@ function animateHero(r) {
 }
 
 function renderStreak() {
-  const g = P.gamification;
+  const g = P.gamification[currentSource] || P.gamification['all'];
   const cards = [];
   const st = g.streak;
   cards.push(`<div class="streak-card" style="--sc-grad:linear-gradient(180deg,#fb923c,#f472b6)">
@@ -343,12 +351,25 @@ function renderStreak() {
     <div class="sc-main">${pk ? fmtTok(pk.total) : '—'}</div>
     <div class="sc-sub">${pk ? pk.date + ' · ' + fmtNum(pk.msgs) + ' 条消息' : '暂无数据'}</div>
   </div>`);
+  // 占比卡: 当前 range 下 claude vs zcode (只对 all source 有意义, 但任何 source 都显示对比)
+  const allTot = (P.ranges['all'][currentRange] || {}).kpi || {};
+  const cTot = (P.ranges['claude'][currentRange] || {}).kpi || {};
+  const zTot = (P.ranges['zcode'][currentRange] || {}).kpi || {};
+  const cT = cTot.total_tokens || 0, zT = zTot.total_tokens || 0;
+  const sum = cT + zT || 1;
+  const cPct = (cT / sum * 100), zPct = (zT / sum * 100);
+  cards.push(`<div class="streak-card" style="--sc-grad:linear-gradient(180deg,#a78bfa,#22d3ee)">
+    <div class="sc-label">⚡ Claude / ZCode</div>
+    <div class="sc-main">${cPct >= zPct ? 'Claude' : 'ZCode'}<small> 主力</small></div>
+    <div class="sc-bar"><div class="seg-c" style="width:${cPct}%"></div><div class="seg-z" style="width:${zPct}%"></div></div>
+    <div class="sc-sub">Claude ${fmtTok(cT)} (${cPct.toFixed(0)}%) · ZCode ${fmtTok(zT)} (${zPct.toFixed(0)}%)</div>
+  </div>`);
   document.getElementById('streak-grid').innerHTML = cards.join('');
 }
 
 // ============ 图表重绘 / range 切换 ============
 function redrawCharts() {
-  const r = P.ranges[currentRange];
+  const r = rangeData();
   const apply = (key, opt) => { if (charts[key]) { if (opt) charts[key].setOption(opt, true); else charts[key].clear(); } };
   apply('calendar', buildCalendar());
   apply('daily', buildDaily(r));
@@ -359,18 +380,41 @@ function redrawCharts() {
   apply('proj', buildProj(r));
 }
 
+function refreshHash() {
+  history.replaceState(null, '', '#range=' + currentRange + '&source=' + currentSource);
+}
+
 function setRange(key) {
-  if (!P.ranges[key]) key = 'week';
+  if (!(P.ranges[currentSource] || {})[key]) key = 'week';
   currentRange = key;
   focusedModel = null;
-  const r = P.ranges[key];
+  const r = rangeData();
   renderMeta(r);
   renderKpi(r, true);
   renderTable(r);
   redrawCharts();
   animateHero(r);
+  renderSparkline();
+  renderStreak();
   document.querySelectorAll('.range-tabs button').forEach(b => b.classList.toggle('active', b.dataset.range === key));
-  history.replaceState(null, '', '#range=' + key);
+  refreshHash();
+}
+
+function setSource(key) {
+  if (!P.ranges[key]) key = 'all';
+  if (!(P.ranges[key] || {})[currentRange]) currentRange = 'all';
+  currentSource = key;
+  focusedModel = null;
+  const r = rangeData();
+  renderMeta(r);
+  renderKpi(r, true);
+  renderTable(r);
+  redrawCharts();
+  animateHero(r);
+  renderSparkline();
+  renderStreak();
+  document.querySelectorAll('.source-tabs button').forEach(b => b.classList.toggle('active', b.dataset.source === key));
+  refreshHash();
 }
 
 // ============ 模型聚焦 (点表格行) ============
@@ -458,6 +502,7 @@ async function capturePage() {
   exportOverlay.classList.add('show');
   document.querySelector('.actions').style.visibility = 'hidden';
   document.querySelector('.range-tabs').style.visibility = 'hidden';
+  const st = document.querySelector('.source-tabs'); if (st) st.style.visibility = 'hidden';
   forceFinalState(true);
   fixGradientText(true);
   await new Promise(r => requestAnimationFrame(r));
@@ -471,6 +516,7 @@ async function capturePage() {
     forceFinalState(false);
     document.querySelector('.actions').style.visibility = '';
     const rt = document.querySelector('.range-tabs'); if (rt) rt.style.visibility = '';
+    if (st) st.style.visibility = '';
     exportOverlay.classList.remove('show');
   }
 }
@@ -522,15 +568,24 @@ async function exportPDF() {
 
   renderSparkline();
   const pulse = document.getElementById('hero-pulse-text');
-  if (pulse) pulse.textContent = '已记录 ' + P.calendar.length + ' 天 · 连续 ' + P.gamification.streak.current + ' 天';
+  const calLen = (P.calendars[currentSource] || []).length;
+  if (pulse) pulse.textContent = '已记录 ' + calLen + ' 天 · 连续 ' + (P.gamification[currentSource] || P.gamification['all']).streak.current + ' 天';
   renderStreak();
 
-  const hashKey = (location.hash.match(/range=([a-z]+)/) || [])[1];
-  setRange(P.ranges[hashKey] ? hashKey : P.range_default);
+  // 解析 hash: 同时读 range 和 source
+  const hRange = (location.hash.match(/range=([a-z_]+)/) || [])[1];
+  const hSource = (location.hash.match(/source=([a-z]+)/) || [])[1];
+  const initSource = (P.ranges[hSource] ? hSource : P.source_default) || 'all';
+  const initRange = ((P.ranges[initSource] || {})[hRange] ? hRange : P.range_default) || 'week';
+  // 先设 source 高亮, 再 setRange (setRange 会 refreshHash 覆盖, 所以手动调一次)
+  currentSource = initSource;
+  document.querySelectorAll('.source-tabs button').forEach(b => b.classList.toggle('active', b.dataset.source === initSource));
+  setRange(initRange);
 
   setupReveal();
   setupParallax();
   document.querySelectorAll('.range-tabs button').forEach(b => b.addEventListener('click', () => setRange(b.dataset.range)));
+  document.querySelectorAll('.source-tabs button').forEach(b => b.addEventListener('click', () => setSource(b.dataset.source)));
   document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
   document.getElementById('btn-png').addEventListener('click', exportPNG);
   document.getElementById('btn-pdf').addEventListener('click', exportPDF);
