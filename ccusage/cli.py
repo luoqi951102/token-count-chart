@@ -243,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("report", help="生成 HTML 报告")
     sp.add_argument(
         "--range", "-r",
-        choices=["today", "week", "month", "all"],
+        choices=["today", "week", "last_week", "month", "all"],
         default="week",
     )
     sp.add_argument("--output", "-o", help="输出目录")
@@ -255,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fresh", action="store_true", help="先同步数据并重新生成")
     sp.add_argument(
         "--range", "-r",
-        choices=["today", "week", "month", "all"],
+        choices=["today", "week", "last_week", "month", "all"],
         default="all",
     )
     sp.add_argument("--output", "-o", help="输出目录")

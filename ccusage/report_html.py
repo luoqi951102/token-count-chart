@@ -148,8 +148,8 @@ def _build_range(conn: sqlite3.Connection, dr: DateRange, cmap: dict[str, str]) 
 
 
 def _infer_range_key(dr: DateRange) -> str:
-    """从 DateRange 反推 today/week/month/all key (用于初始高亮 tab)."""
-    for key in ("today", "week", "month", "all"):
+    """从 DateRange 反推 today/week/last_week/month/all key (用于初始高亮 tab)."""
+    for key in ("today", "week", "last_week", "month", "all"):
         r = resolve_range(key)
         if r.start == dr.start and r.end == dr.end:
             return key
@@ -168,10 +168,10 @@ def render(conn: sqlite3.Connection, dr: DateRange, output_path: Path) -> Path:
     calendar_data = [{"name": d["date"], "value": d["total"]} for d in all_daily]
     sparkline = calendar_data[-14:]
 
-    # 4 range 预计算 (前端切 range 只换数据源, 零聚合)
+    # 5 range 预计算 (前端切 range 只换数据源, 零聚合)
     ranges = {
         key: _build_range(conn, resolve_range(key), cmap)
-        for key in ("today", "week", "month", "all")
+        for key in ("today", "week", "last_week", "month", "all")
     }
 
     # 游戏化指标 (全量, 与 range 无关)
@@ -245,6 +245,7 @@ def _build_html(p: dict) -> str:
       <div class="range-tabs" id="range-tabs">
         <button type="button" data-range="today">今日</button>
         <button type="button" data-range="week">本周</button>
+        <button type="button" data-range="last_week">上周</button>
         <button type="button" data-range="month">本月</button>
         <button type="button" data-range="all">全部</button>
       </div>
