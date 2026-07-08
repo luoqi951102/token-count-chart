@@ -153,6 +153,24 @@ body {
   box-shadow: 0 4px 18px rgba(167,139,250,0.45);
 }
 
+/* source 切换器: 复用 range-tabs 结构, 渐变换成青绿系区分 */
+.source-tabs {
+  display: inline-flex; gap: 4px; padding: 5px;
+  background: var(--card); border: 1px solid var(--card-border);
+  border-radius: 14px; backdrop-filter: blur(20px);
+}
+.source-tabs button {
+  padding: 9px 18px; border: none; background: transparent;
+  color: var(--text-dim); font-size: 13px; font-weight: 600; font-family: inherit;
+  border-radius: 10px; cursor: pointer; transition: color .25s, background .25s, box-shadow .25s;
+}
+.source-tabs button:hover { color: var(--text); }
+.source-tabs button.active {
+  color: #fff;
+  background: linear-gradient(135deg, #22d3ee, #34d399);
+  box-shadow: 0 4px 18px rgba(34,211,238,0.45);
+}
+
 /* ============ KPI ============ */
 .kpi-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; margin-bottom: 28px; }
 @media (max-width: 900px) { .kpi-grid { grid-template-columns: repeat(3, 1fr); } }
@@ -178,7 +196,8 @@ body {
 .kpi .sub { font-size: 11px; color: var(--text-faint); margin-top: 4px; }
 
 /* ============ 游戏化指标 ============ */
-.streak-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
+.streak-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 28px; }
+@media (max-width: 1200px) { .streak-grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 900px) { .streak-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 500px) { .streak-grid { grid-template-columns: 1fr; } }
 .streak-card {
@@ -210,6 +229,8 @@ body {
 [data-theme="light"] .sc-bar { background: rgba(0,0,0,0.06); }
 .sc-bar .seg-w { background: linear-gradient(90deg, #60a5fa, #a78bfa); }
 .sc-bar .seg-e { background: linear-gradient(90deg, #f472b6, #fbbf24); }
+.sc-bar .seg-c { background: linear-gradient(90deg, #a78bfa, #f472b6); }
+.sc-bar .seg-z { background: linear-gradient(90deg, #22d3ee, #34d399); }
 
 /* ============ CARD 网格 ============ */
 .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 20px; margin-bottom: 20px; }

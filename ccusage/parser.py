@@ -37,6 +37,11 @@ def default_projects_dir() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+def default_zcode_db() -> Path:
+    """返回默认的 ZCode 用量数据库路径 (~/.zcode/cli/db/db.sqlite)."""
+    return Path.home() / ".zcode" / "cli" / "db" / "db.sqlite"
+
+
 def iter_jsonl_files(projects_dir: Path) -> Iterator[tuple[Path, str]]:
     """遍历所有会话 JSONL 文件, yield (filepath, project_name)."""
     if not projects_dir.exists():

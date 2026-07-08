@@ -21,8 +21,8 @@ from .aggregate import (
     now_in_sh,
     date_range_span,
 )
-from .db import connect, sync, get_meta
-from .parser import default_projects_dir
+from .db import connect, sync, sync_zcode, get_meta
+from .parser import default_projects_dir, default_zcode_db
 from .report_html import render as render_html
 from .report_text import render as render_text
 
@@ -36,21 +36,35 @@ def default_output_dir() -> Path:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    projects_dir = Path(args.projects_dir).expanduser()
     db_path = Path(args.db).expanduser()
-    if not projects_dir.exists():
-        print(f"❌ 找不到目录: {projects_dir}", file=sys.stderr)
-        return 1
+    only = getattr(args, "only", None) or "all"
     conn = connect(db_path)
     try:
-        sync(conn, projects_dir, force=args.force, verbose=True)
+        if only in ("all", "claude"):
+            projects_dir = Path(args.projects_dir).expanduser()
+            if not projects_dir.exists():
+                print(f"❌ 找不到 Claude projects 目录: {projects_dir}", file=sys.stderr)
+                if only == "claude":
+                    return 1
+            else:
+                sync(conn, projects_dir, force=args.force, verbose=True)
+        if only in ("all", "zcode"):
+            zcode_db = Path(getattr(args, "zcode_db", None) or default_zcode_db()).expanduser()
+            sync_zcode(conn, zcode_db, verbose=True)
         # 统计
         total = conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0]
         models = conn.execute("SELECT COUNT(DISTINCT model) FROM usage").fetchone()[0]
+        by_source = dict(
+            conn.execute(
+                "SELECT source, COUNT(*) FROM usage GROUP BY source"
+            ).fetchall()
+        )
         span = date_range_span(conn)
+        src_str = " · ".join(f"{s}: {c:,}" for s, c in sorted(by_source.items()))
         print(
             f"✅ 数据库: {db_path}\n"
             f"   总记录: {total:,} 条 | 模型: {models} 个\n"
+            f"   来源: {src_str or '(空)'}\n"
             f"   范围: {span[0]} ~ {span[1]}"
         )
     finally:
@@ -66,7 +80,8 @@ def _print_report(args: argparse.Namespace) -> int:
     conn = connect(db_path)
     try:
         dr = resolve_range(args.range)
-        print(render_text(conn, dr))
+        source = getattr(args, "source", "all")
+        print(render_text(conn, dr, source))
     finally:
         conn.close()
     return 0
@@ -80,6 +95,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     conn = connect(db_path)
     try:
         dr = resolve_range(args.range)
+        source = getattr(args, "source", "all")
         out_dir = Path(args.output).expanduser() if args.output else default_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         # all 范围用实际数据范围命名, 更友好
@@ -88,9 +104,11 @@ def cmd_report(args: argparse.Namespace) -> int:
             tag = f"{span[0]}-to-{span[1]}" if span[0] else "all"
         else:
             tag = f"{dr.start}-to-{dr.end}"
+        if source != "all":
+            tag += f"-{source}"
         fname = f"usage-{tag}.html"
         out_path = out_dir / fname
-        render_html(conn, dr, out_path)
+        render_html(conn, dr, out_path, source=source)
         print(f"✅ 报告已生成:\n   {out_path}")
         if args.open:
             url = out_path.resolve().as_uri()
@@ -135,15 +153,19 @@ def cmd_open(args: argparse.Namespace) -> int:
         conn = connect(db_path)
         try:
             sync(conn, default_projects_dir(), verbose=False)
+            sync_zcode(conn, default_zcode_db(), verbose=False)
             dr = resolve_range(args.range)
+            source = getattr(args, "source", "all")
             out_dir.mkdir(parents=True, exist_ok=True)
             if args.range == "all":
                 span = date_range_span(conn)
                 tag = f"{span[0]}-to-{span[1]}"
             else:
                 tag = f"{dr.start}-to-{dr.end}"
+            if source != "all":
+                tag += f"-{source}"
             target = out_dir / f"usage-{tag}.html"
-            render_html(conn, dr, target)
+            render_html(conn, dr, target, source=source)
             _refresh_latest(out_dir, target)
             print(f"✅ 已刷新: {target.name}")
         finally:
@@ -202,12 +224,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         span = date_range_span(conn)
         last = get_meta(conn, "last_sync")
+        by_source = dict(
+            conn.execute(
+                "SELECT source, COUNT(*) FROM usage GROUP BY source"
+            ).fetchall()
+        )
         print(f"cc-usage v{__version__}")
         print(f"数据库:    {db_path}")
         print(f"最后同步:  {last or '(无)'}")
         print(f"数据范围:  {span[0]} ~ {span[1]}" if span[0] else "数据范围:  (空)")
         print(f"文件数:    {files}")
         print(f"记录数:    {total:,}")
+        src_str = " · ".join(f"{s}: {c:,}" for s, c in sorted(by_source.items()))
+        print(f"来源:      {src_str or '(空)'}")
         print(f"模型数:    {models}")
         print(f"当前时间:  {now_in_sh().strftime('%Y-%m-%d %H:%M:%S')} (Asia/Shanghai)")
     finally:
@@ -232,11 +261,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(default_projects_dir()),
         help="Claude projects 目录",
     )
+    sp.add_argument(
+        "--only",
+        choices=["claude", "zcode", "all"],
+        default="all",
+        help="只同步指定来源 (默认全部)",
+    )
+    sp.add_argument(
+        "--zcode-db",
+        default=None,
+        help="ZCode 数据库路径 (默认 ~/.zcode/cli/db/db.sqlite)",
+    )
     sp.set_defaults(func=cmd_sync)
 
     # today / week / month 直接走 _print_report
     for rng in ("today", "week", "month"):
         sp = sub.add_parser(rng, help=f"{rng} 终端报告")
+        sp.add_argument(
+            "--source",
+            choices=["all", "claude", "zcode"],
+            default="all",
+            help="只看某个工具的用量",
+        )
         sp.set_defaults(func=_print_report, range=rng)
 
     # report (html)
@@ -245,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--range", "-r",
         choices=["today", "week", "last_week", "month", "all"],
         default="week",
+    )
+    sp.add_argument(
+        "--source",
+        choices=["all", "claude", "zcode"],
+        default="all",
+        help="只看某个工具的用量",
     )
     sp.add_argument("--output", "-o", help="输出目录")
     sp.add_argument("--open", action="store_true", help="生成后用浏览器打开")
@@ -257,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--range", "-r",
         choices=["today", "week", "last_week", "month", "all"],
         default="all",
+    )
+    sp.add_argument(
+        "--source",
+        choices=["all", "claude", "zcode"],
+        default="all",
+        help="只看某个工具的用量",
     )
     sp.add_argument("--output", "-o", help="输出目录")
     sp.set_defaults(func=cmd_open)
