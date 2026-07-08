@@ -196,8 +196,8 @@ def render(
     gamification = {}
     for sk in _SOURCE_KEYS:
         gamification[sk] = {
-            "streak": streak(conn),
-            "wow": week_over_week(conn),
+            "streak": streak(conn, sk),
+            "wow": week_over_week(conn, sk),
             "weekday_weekend": weekday_vs_weekend(conn, _ALL_START, _ALL_END),
             "peak": peak_day(conn, _ALL_START, _ALL_END, sk),
         }

@@ -64,9 +64,7 @@ _MIGRATIONS = [
 def _local_parts(ts_utc: str) -> tuple[str, int]:
     """UTC ISO 时间 -> (上海日期 YYYY-MM-DD, 小时 0-23)."""
     from datetime import datetime
-    from zoneinfo import ZoneInfo
-
-    SH = ZoneInfo("Asia/Shanghai")
+    from .aggregate import SH
     dt = datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
     local = dt.astimezone(SH)
     return local.strftime("%Y-%m-%d"), local.hour
@@ -75,9 +73,7 @@ def _local_parts(ts_utc: str) -> tuple[str, int]:
 def _local_parts_epoch(ms_epoch: int) -> tuple[str, int]:
     """毫秒级 epoch -> (上海日期 YYYY-MM-DD, 小时 0-23)."""
     from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-
-    SH = ZoneInfo("Asia/Shanghai")
+    from .aggregate import SH
     dt = datetime.fromtimestamp(ms_epoch / 1000, tz=timezone.utc).astimezone(SH)
     return dt.strftime("%Y-%m-%d"), dt.hour
 
@@ -277,6 +273,7 @@ def sync_zcode(
         return stats
 
     new_watermark = watermark
+    batch = []  # 收集后批量插入 (与 Claude 路径 executemany 一致)
     for (
         ext_id, started_at, completed_at, model_id,
         inp, cw, cr, outp, total, tool_count,
@@ -289,8 +286,24 @@ def sync_zcode(
             stats["errors"] += 1
             continue
         ts_iso = _epoch_ms_to_iso(started_at)
+        batch.append(
+            (
+                ts_iso, local_date, local_hour, model_id,
+                inp or 0, cw or 0, cr or 0, outp or 0, total or 0,
+                1, session_id or "", directory or "", directory or "",
+                ext_id,
+            )
+        )
+        if completed_at and completed_at > new_watermark:
+            new_watermark = completed_at
+
+    # 批量 INSERT OR IGNORE, 靠 (source, ext_id) 唯一索引去重
+    if batch:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM usage WHERE source='zcode'"
+        ).fetchone()[0]
         try:
-            cur = conn.execute(
+            conn.executemany(
                 """
                 INSERT OR IGNORE INTO usage
                 (timestamp, local_date, local_hour, model,
@@ -299,21 +312,16 @@ def sync_zcode(
                  msg_count, session_id, cwd, project, source_file, source, ext_id)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'','zcode',?)
                 """,
-                (
-                    ts_iso, local_date, local_hour, model_id,
-                    inp or 0, cw or 0, cr or 0, outp or 0, total or 0,
-                    1, session_id or "", directory or "", directory or "",
-                    ext_id,
-                ),
+                batch,
             )
-            if cur.rowcount:
-                stats["new"] += 1
-            else:
-                stats["skipped"] += 1
+            after = conn.execute(
+                "SELECT COUNT(*) FROM usage WHERE source='zcode'"
+            ).fetchone()[0]
+            inserted = after - before
+            stats["new"] = inserted
+            stats["skipped"] = len(batch) - inserted
         except sqlite3.Error:
-            stats["errors"] += 1
-        if completed_at and completed_at > new_watermark:
-            new_watermark = completed_at
+            stats["errors"] += len(batch)
 
     conn.commit()
     if new_watermark > watermark:
