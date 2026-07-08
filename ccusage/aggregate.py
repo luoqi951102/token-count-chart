@@ -21,10 +21,6 @@ class DateRange:
     label: str  # 展示用
 
 
-def today_str() -> str:
-    return datetime.now(SH).strftime("%Y-%m-%d")
-
-
 def now_in_sh() -> datetime:
     return datetime.now(SH)
 
@@ -275,14 +271,17 @@ def active_projects(
 # ---------- 游戏化指标 ----------
 
 
-def streak(conn: sqlite3.Connection) -> dict:
+def streak(conn: sqlite3.Connection, source: str = "all") -> dict:
     """连续打卡天数.
 
     current: 从今天往前数的连续天数 (今天没数据则从昨天起算, 更友好);
     longest: 历史最长连续; active_today: 今天是否有用量.
+    source 可选过滤 'claude'/'zcode'.
     """
     rows = conn.execute(
-        "SELECT DISTINCT local_date FROM usage ORDER BY local_date"
+        "SELECT DISTINCT local_date FROM usage "
+        "WHERE (source = ? OR ? = 'all') ORDER BY local_date",
+        (source, source),
     ).fetchall()
     dates = sorted(r[0] for r in rows)
     if not dates:
@@ -388,8 +387,10 @@ def source_breakdown(
     return res
 
 
-def week_over_week(conn: sqlite3.Connection) -> dict:
-    """本周 vs 上周总量环比. delta_pct: 涨跌百分比 (上周为 0 则 None)."""
+def week_over_week(conn: sqlite3.Connection, source: str = "all") -> dict:
+    """本周 vs 上周总量环比. delta_pct: 涨跌百分比 (上周为 0 则 None).
+    source 可选过滤 'claude'/'zcode'.
+    """
     this = resolve_range("week")
     last_start = (
         datetime.strptime(this.start, "%Y-%m-%d") - timedelta(days=7)
@@ -401,8 +402,8 @@ def week_over_week(conn: sqlite3.Connection) -> dict:
     def _sum(s: str, e: str) -> int:
         r = conn.execute(
             "SELECT COALESCE(SUM(total_context), 0) FROM usage "
-            "WHERE local_date BETWEEN ? AND ?",
-            (s, e),
+            "WHERE local_date BETWEEN ? AND ? AND (source = ? OR ? = 'all')",
+            (s, e, source, source),
         ).fetchone()
         return r[0] or 0
 

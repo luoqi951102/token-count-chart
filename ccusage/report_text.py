@@ -173,6 +173,7 @@ def render(conn: sqlite3.Connection, dr: DateRange, source: str = "all") -> str:
             wd = datetime.strptime(d["date"], "%Y-%m-%d").weekday()
             wdn = ["一", "二", "三", "四", "五", "六", "日"][wd]
         except Exception:
+            wd = 0
             wdn = "?"
         weekend = C.RED if wd >= 5 else C.RESET
         out.append(
