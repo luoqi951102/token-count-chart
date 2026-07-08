@@ -245,8 +245,23 @@ def sync_zcode(
             print(f"⏭️  ZCode 数据库不存在, 跳过: {zcode_db}")
         return stats
 
-    # 读 ZCode 库 (只读, 不影响 ZCode 自身的 WAL)
-    src = sqlite3.connect(f"file:{zcode_db}?mode=ro", uri=True)
+    # 读 ZCode 库 (immutable 只读: 不碰 -wal/-shm, 避免 ZCode 持锁时打开失败)
+    # 退路: immutable 失败 (如 WAL 未 checkpoint) 再降级普通只读
+    src = None
+    for uri in (f"file:{zcode_db}?immutable=1", f"file:{zcode_db}?mode=ro"):
+        try:
+            src = sqlite3.connect(uri, uri=True)
+            src.execute("SELECT COUNT(*) FROM model_usage").fetchone()
+            break
+        except sqlite3.Error:
+            if src:
+                src.close()
+                src = None
+    if src is None:
+        if verbose:
+            print(f"⚠️  ZCode 库暂时读不了 (可能正被占用), 跳过: {zcode_db}")
+        return stats
+
     try:
         # 水位线: 上次同步过的最大 completed_at
         watermark = int(get_meta(conn, "zcode_last_completed_at") or 0)
