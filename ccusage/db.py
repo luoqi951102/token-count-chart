@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS usage (
     project TEXT,
     source_file TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'claude',
-    ext_id TEXT NOT NULL DEFAULT ''
+    ext_id TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_usage_date ON usage(local_date);
 CREATE INDEX IF NOT EXISTS idx_usage_date_model ON usage(local_date, model);
@@ -54,10 +55,11 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-# 迁移: 给旧库 (无 source/ext_id 列) 补列. 幂等, 已存在则跳过.
+# 迁移: 给旧库补列. 幂等, 已存在则跳过.
 _MIGRATIONS = [
     "ALTER TABLE usage ADD COLUMN source TEXT NOT NULL DEFAULT 'claude'",
     "ALTER TABLE usage ADD COLUMN ext_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE usage ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
 ]
 
 
@@ -82,18 +84,23 @@ def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.executescript(SCHEMA)
-    # 旧库迁移: 补 source / ext_id 列 (幂等)
+    # 旧库迁移: 补 source / ext_id / provider 列 (幂等)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(usage)").fetchall()}
     if "source" not in cols:
         conn.execute("ALTER TABLE usage ADD COLUMN source TEXT NOT NULL DEFAULT 'claude'")
     if "ext_id" not in cols:
         conn.execute("ALTER TABLE usage ADD COLUMN ext_id TEXT NOT NULL DEFAULT ''")
+    if "provider" not in cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
     # 幂等: 确保 source 相关索引存在 (无论新旧库, 列已就位)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_source ON usage(source)")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_source_ext "
         "ON usage(source, ext_id) WHERE ext_id != ''"
     )
+    # provider 维度索引（用于按供应商聚合）
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage(provider)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_model_provider ON usage(model, provider)")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
@@ -271,7 +278,7 @@ def sync_zcode(
                    m.input_tokens, m.cache_creation_input_tokens,
                    m.cache_read_input_tokens, m.output_tokens,
                    m.computed_total_tokens, m.tool_call_count,
-                   m.session_id, s.directory
+                   m.session_id, s.directory, m.provider_id
             FROM model_usage m
             LEFT JOIN session s ON m.session_id = s.id
             WHERE m.completed_at > ? AND m.status = 'completed'
@@ -292,7 +299,7 @@ def sync_zcode(
     for (
         ext_id, started_at, completed_at, model_id,
         inp, cw, cr, outp, total, tool_count,
-        session_id, directory,
+        session_id, directory, provider_id,
     ) in rows:
         # 时间用 started_at 分桶 (用户实际开始用的时间)
         try:
@@ -306,7 +313,7 @@ def sync_zcode(
                 ts_iso, local_date, local_hour, model_id,
                 inp or 0, cw or 0, cr or 0, outp or 0, total or 0,
                 1, session_id or "", directory or "", directory or "",
-                ext_id,
+                ext_id, provider_id or "",
             )
         )
         if completed_at and completed_at > new_watermark:
@@ -324,8 +331,8 @@ def sync_zcode(
                 (timestamp, local_date, local_hour, model,
                  input_tokens, cache_creation_input_tokens,
                  cache_read_input_tokens, output_tokens, total_context,
-                 msg_count, session_id, cwd, project, source_file, source, ext_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'','zcode',?)
+                 msg_count, session_id, cwd, project, source_file, source, ext_id, provider)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'','zcode',?,?)
                 """,
                 batch,
             )
