@@ -4,17 +4,62 @@
 - usage 表存每条用量记录 (Claude assistant 行 或 ZCode model_usage 行)
   · source 列区分来源: 'claude' / 'zcode'
   · ext_id 列存外部去重键 (ZCode 的 model_usage.id; Claude 留空, 靠 source_file 重解析清理)
+  · provider 列存供应商标识:
+      - ZCode 来自 model_usage.provider_id (UUID 或 builtin:xxx)
+      - Claude 存当时的 ANTHROPIC_BASE_URL 原文 (e.g. "https://api.goodputai.cn");
+        Claude JSONL 不记 baseURL, 所以只能 going-forward 打标,
+        历史已入库的行维持空字符串, 不回溯改写.
+      - Swift 端负责 baseURL → 友好名 的二级映射.
 - files 表记录已解析的 Claude 文件 mtime+size, 未变化则跳过
 - 改动文件: 先 DELETE WHERE source_file=? 再重新 INSERT
+  · 但在 DELETE 前快照 (timestamp, provider) → INSERT 后按 timestamp 回填,
+    避免「会话文件被 append 后整盘改写供应商」的脏数据.
 - ZCode 同步: 按 completed_at 水位线增量, INSERT OR IGNORE 幂等
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Iterator
 
 from .parser import UsageRecord, file_signature, iter_jsonl_files, parse_file
+
+
+def _read_claude_base_url(settings_path: Path | None = None) -> str:
+    """读 ~/.claude/settings.json 里的 ANTHROPIC_BASE_URL.
+
+    CCM 切供应商时会把当前 baseURL 写到 env.ANTHROPIC_BASE_URL.
+    用于对 Claude 新行做 going-forward 供应商打标. 读不出则返回空串.
+
+    CCM 内置支持的 baseURL → 友好名映射 (Swift 端再做, 这里只存原文):
+      https://api.z.ai/api/anthropic                                → 智谱官方·国际
+      https://open.bigmodel.cn/api/anthropic                        → 智谱官方·国内
+      https://api.deepseek.com/anthropic                            → DeepSeek
+      https://api.moonshot.ai/anthropic                             → 月之暗面·国际
+      https://api.moonshot.cn/anthropic                             → 月之暗面·国内
+      https://coding-intl.dashscope.aliyuncs.com/apps/anthropic     → 通义千问·国际
+      https://coding.dashscope.aliyuncs.com/apps/anthropic          → 通义千问·国内
+      https://api.minimax.io/anthropic                              → Minimax·国际
+      https://api.minimaxi.com/anthropic                            → Minimax·国内
+      https://ark.cn-beijing.volces.com/api/coding                  → 火山引擎
+      https://api.stepfun.ai/v1/anthropic                           → StepFun
+      https://api.anthropic.com/                                    → Anthropic 官方
+      (第三方代理如 api.goodputai.cn 不在 CCM 标准表, 走用户自定义别名)
+    """
+    p = settings_path or (Path.home() / ".claude" / "settings.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(d, dict):
+        return ""
+    env = d.get("env")
+    if not isinstance(env, dict):
+        return ""
+    url = env.get("ANTHROPIC_BASE_URL", "")
+    return url if isinstance(url, str) else ""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage (
@@ -135,6 +180,15 @@ def sync(
 
     seen_paths = set()
 
+    # 把当前 Claude settings.json 里的 baseURL 拿到, 用于给新行打标
+    current_base_url = _read_claude_base_url()
+    if verbose and current_base_url:
+        print(f"🔑 Claude 当前 baseURL: {current_base_url}")
+
+    # 累积「文件被 DELETE+INSERT 时, 该回填的旧 provider」
+    # key: (source_file, timestamp) → value: 原 provider
+    provider_snapshots: dict[tuple[str, str], str] = {}
+
     for filepath, project in iter_jsonl_files(projects_dir):
         stats["scanned"] += 1
         path_str = str(filepath)
@@ -151,8 +205,16 @@ def sync(
             stats["skipped"] += 1
             continue
 
-        # 清理旧记录 (如果是更新)
+        # 清理旧记录 (如果是更新): 先快照 (timestamp, provider) 再 DELETE,
+        # 这样重 INSERT 后能根据 timestamp 把「已标注的 provider」原样回填,
+        # 避免会话文件被 append 后整盘改写成当前 baseURL 的脏数据.
         if prev is not None:
+            for ts, prov in cur.execute(
+                "SELECT timestamp, provider FROM usage WHERE source_file = ?",
+                (path_str,),
+            ).fetchall():
+                if prov:  # 只回填非空的 (历史空值由 baseURL 写新, 不保护)
+                    provider_snapshots[(path_str, ts)] = prov
             cur.execute("DELETE FROM usage WHERE source_file = ?", (path_str,))
             stats["updated"] += 1
         else:
@@ -166,6 +228,10 @@ def sync(
                 + rec.cache_creation_input_tokens
                 + rec.cache_read_input_tokens
             )
+            # going-forward: 用当前 settings.json 的 baseURL 给新行打标
+            # 但如果该 timestamp 在旧快照里有非空 provider, 说明上次已标好, 沿用旧值
+            keep = provider_snapshots.get((path_str, rec.timestamp))
+            provider_val = keep if keep else current_base_url
             rows.append(
                 (
                     rec.timestamp,
@@ -182,6 +248,7 @@ def sync(
                     rec.cwd,
                     rec.project,
                     rec.source_file,
+                    provider_val,
                 )
             )
 
@@ -191,8 +258,8 @@ def sync(
                 (timestamp, local_date, local_hour, model,
                  input_tokens, cache_creation_input_tokens,
                  cache_read_input_tokens, output_tokens, total_context,
-                 msg_count, session_id, cwd, project, source_file)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 msg_count, session_id, cwd, project, source_file, provider)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 rows,
             )
             stats["records"] += len(rows)
