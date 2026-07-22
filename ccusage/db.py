@@ -441,3 +441,200 @@ def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> 
         "SELECT value FROM meta WHERE key=?", (key,)
     ).fetchone()
     return row[0] if row else default
+
+
+# MARK: - Provider 历史回填
+
+# msg.id 格式 → provider baseURL 的指纹映射表（与 Swift 端 BaseURLProviderMap 对齐）
+# 这些是 Claude Code 转发请求时各供应商响应里返回的 request_id 原文格式，
+# 比任何其他 Claude JSONL 字段都更可靠地区分供应商。
+#
+# 已知格式（来自实测）：
+#   ^021\d+                          火山引擎方舟 request_id（前缀 021 + 数字）
+#                                    覆盖: deepseek-v4-flash, deepseek-v4-pro, doubao, minimax-m3
+#   ^msg_01[A-Za-z0-9]{4,}           Anthropic 官方格式（用户确认经浙算 MaaS 代理）
+#                                    覆盖: claude-opus-4-8
+#   ^msg_[0-9a-f]{32}$               goodputai 量化部署格式（无连字符的 32 位 hex）
+#                                    覆盖: glm-52-w4a8-kv / kvp
+#   ^msg_\d{14,}                     goodputai 代理格式（msg_ + 14 位以上时间戳）
+#                                    覆盖: glm-5.2 (90%)
+#   ^msg_[0-9a-f]{8}-[0-9a-f]{4}-... 标准 UUID 格式 → 走 OpenAI 兼容代理
+#                                     glm-*  → ai.zj-computility.com 浙算 MaaS
+#                                     qwen*  → 通义千问 DashScope
+#   ^chatcmpl-                       OpenAI 标准格式 → OpenAI 兼容代理
+#                                     仅 qwen3 (22 条不确定)
+_MSGID_PATTERNS = [
+    # (compiled regex, provider baseURL, 备注)
+    (r"^021\d+", "https://ark.cn-beijing.volces.com/api/coding", "火山方舟"),
+    (r"^msg_01[A-Za-z0-9]{4,}", "https://ai.zj-computility.com/maas", "Anthropic 经浙算代理"),
+    (r"^msg_[0-9a-f]{32}$", "https://api.goodputai.cn", "goodputai 量化部署"),
+    (r"^msg_\d{14,}", "https://api.goodputai.cn", "goodputai 代理 msg_timestamp"),
+]
+
+
+def _classify_provider_from_msgid(mid: str, model: str) -> str:
+    """根据 Claude JSONL message.id 格式推断供应商 baseURL。
+
+    返回 baseURL 原文（写入 ccusage.db usage.provider 列），无匹配返回空串。
+    对没匹配 msgid 但 model 已知的特殊情况，做 model 维度回退（少数边角）。
+    """
+    if not mid:
+        return ""
+    import re
+    for pattern, url, _ in _MSGID_PATTERNS:
+        if re.match(pattern, mid):
+            return url
+    # UUID 格式 → 按 model 区分 glm* vs qwen*
+    if re.match(r"^msg_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", mid):
+        if model.startswith("qwen"):
+            return "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+        if model.startswith("glm"):
+            return "https://ai.zj-computility.com/maas"
+        return ""
+    return ""
+
+
+def backfill_provider(
+    conn: sqlite3.Connection,
+    projects_dir: Path,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """扫所有 Claude JSONL 文件的 message.id 指纹，回填空 provider 历史 Claude 行。
+
+    策略：
+    - 读取每个 assistant 行的 (timestamp, message.id, model)
+    - 按 msgid 指纹映射到 baseURL
+    - 只更新 provider='' 的 Claude 行（已带标签的不动，避免覆盖新数据）
+    - 用 timestamp 做 DB 关联键（Claude JSONL 里 timestamp 是稳定的）
+
+    返回 {scanned, matched, updated, skipped_tagged, unmatched_models, before/after 分布}
+    """
+    import json
+
+    stats = {
+        "scanned": 0,         # JSONL 里扫到的 assistant 行数
+        "matched": 0,         # msgid 指纹命中数
+        "updated": 0,         # 实际 UPDATE 行数
+        "skipped_tagged": 0,  # DB 里已有 provider 非空、跳过未改的行数
+        "unmatched": 0,       # msgid 指纹未命中（仍未打标）的行数
+        "dry_run": dry_run,
+    }
+    # timestamp → (baseURL, model)
+    msgid_index: dict[str, tuple[str, str]] = {}
+    # 没匹配到 msgid 的 (model, msgid_prefix) 统计，便于报告
+    unmatched_seens: dict[tuple[str, str], int] = {}
+
+    projects_path = Path(projects_dir)
+    if not projects_path.exists():
+        if verbose:
+            print(f"⚠️  Claude projects 目录不存在: {projects_path}")
+        return stats
+
+    # 扫所有 JSONL
+    for project_dir in sorted(projects_path.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        for f in sorted(project_dir.glob("*.jsonl")):
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    for line in fp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(d, dict) or d.get("type") != "assistant":
+                            continue
+                        msg = d.get("message")
+                        if not isinstance(msg, dict):
+                            continue
+                        model = msg.get("model") or ""
+                        if not model or model in {"<synthetic>", ""}:
+                            continue
+                        ts = d.get("timestamp", "")
+                        if not ts:
+                            continue
+                        mid = msg.get("id", "")
+                        stats["scanned"] += 1
+                        url = _classify_provider_from_msgid(mid, model)
+                        if url:
+                            msgid_index[ts] = (url, model)
+                            stats["matched"] += 1
+                        else:
+                            stats["unmatched"] += 1
+                            prefix = mid[:24] if mid else "<empty>"
+                            key = (model, prefix)
+                            unmatched_seens[key] = unmatched_seens.get(key, 0) + 1
+            except OSError:
+                continue
+
+    if verbose:
+        print(
+            f"扫描 JSONL {stats['scanned']} 条 assistant 行 | "
+            f"msgid 指纹命中 {stats['matched']} | 未命中 {stats['unmatched']}"
+        )
+
+    # 把 msgid_index 转成 model→baseURL 分布（用于报告）
+    model_url_counts: dict[tuple[str, str], int] = {}
+    for ts, (url, model) in msgid_index.items():
+        model_url_counts[(model, url)] = model_url_counts.get((model, url), 0) + 1
+
+    if dry_run:
+        if verbose:
+            print("\n[Dry-run] 模式：不写入 DB，只展示将要更新的分布\n")
+            print("=== (model, baseURL) 将会回填的分布 ===")
+            for (m, u), n in sorted(model_url_counts.items(), key=lambda x: -x[1]):
+                print(f"  {m:30s}  {u:55s}  {n:6d} 条")
+            print()
+            if unmatched_seens:
+                print("=== 未匹配 msgid 指纹的 (model, msgid前缀) ===")
+                for (m, p), n in sorted(unmatched_seens.items(), key=lambda x: -x[1]):
+                    print(f"  {m:30s}  {p:30s}  {n:6d} 条")
+        return stats
+
+    # 批量 UPDATE：按 timestamp 走 WHERE
+    # 只更新 provider='' 的 Claude 行
+    cur = conn.cursor()
+    for ts, (url, model) in msgid_index.items():
+        # 看该 timestamp 对应的 Claude 行是否是空 provider
+        row = cur.execute(
+            "SELECT rowid FROM usage WHERE source='claude' AND timestamp=? AND provider=''",
+            (ts,),
+        ).fetchone()
+        if row is None:
+            # 要么已带 provider，要么不在 DB 里
+            stats["skipped_tagged"] += 1
+            continue
+        cur.execute(
+            "UPDATE usage SET provider=? WHERE source='claude' AND timestamp=? AND provider=''",
+            (url, ts),
+        )
+        stats["updated"] += cur.rowcount
+
+    conn.commit()
+
+    if verbose:
+        print(f"\n✓ 已回填 {stats['updated']} 行空 provider Claude 行")
+        print(f"  跳过（已带标签或不在DB）: {stats['skipped_tagged']}")
+        print()
+        print("=== 回填后 Claude 各 (model, provider) 分布 ===")
+        rows = cur.execute(
+            """
+            SELECT model,
+                   CASE WHEN provider='' THEN '<空·未匹配>' ELSE provider END,
+                   COUNT(*)
+            FROM usage WHERE source='claude'
+            GROUP BY model, 2 ORDER BY model, 3 DESC
+            """
+        ).fetchall()
+        for m, p, n in rows:
+            print(f"  {m:30s}  {p:55s}  {n:6d}")
+        if stats["unmatched"] > 0 and unmatched_seens:
+            print()
+            print("=== 未匹配 msgid 指纹的可疑 (model, msgid前缀) ===")
+            for (m, p), n in sorted(unmatched_seens.items(), key=lambda x: -x[1])[:10]:
+                print(f"  {m:30s}  {p:30s}  {n:6d} 条")
+    return stats

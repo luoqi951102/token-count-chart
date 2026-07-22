@@ -21,7 +21,7 @@ from .aggregate import (
     now_in_sh,
     date_range_span,
 )
-from .db import connect, sync, sync_zcode, get_meta
+from .db import connect, sync, sync_zcode, get_meta, backfill_provider
 from .parser import default_projects_dir, default_zcode_db
 from .report_html import render as render_html
 from .report_text import render as render_text
@@ -212,6 +212,33 @@ def cmd_open(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_provider(args: argparse.Namespace) -> int:
+    """扫 Claude JSONL 的 message.id 指纹，回填空 provider 历史 Claude 行."""
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print("数据库不存在. 运行 `cc-usage sync` 初始化.")
+        return 1
+    conn = connect(db_path)
+    try:
+        stats = backfill_provider(
+            conn,
+            Path(args.projects_dir).expanduser(),
+            dry_run=args.dry_run,
+            verbose=True,
+        )
+        print()
+        print(
+            f"扫描 {stats['scanned']} | 命中 {stats['matched']} | "
+            f"更新 {stats['updated']} | 跳过 {stats['skipped_tagged']} | "
+            f"未匹配 {stats['unmatched']}"
+        )
+        if args.dry_run:
+            print("\n(Dry-run 模式: 未写入. 去掉 --dry-run 实际执行回填)")
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser()
     if not db_path.exists():
@@ -322,6 +349,23 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     sp = sub.add_parser("status", help="查看数据库状态")
     sp.set_defaults(func=cmd_status)
+
+    # backfill-provider（一次性历史回填）
+    sp = sub.add_parser(
+        "backfill-provider",
+        help="用 Claude JSONL 的 message.id 指纹回填空 provider 历史 Claude 行",
+    )
+    sp.add_argument(
+        "--projects-dir",
+        default=str(default_projects_dir()),
+        help="Claude projects 目录",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只展示回填分布，不实际写入",
+    )
+    sp.set_defaults(func=cmd_backfill_provider)
 
     return p
 
