@@ -21,7 +21,7 @@ from .aggregate import (
     now_in_sh,
     date_range_span,
 )
-from .db import connect, sync, sync_zcode, get_meta, backfill_provider
+from .db import connect, sync, sync_zcode, get_meta, backfill_provider, reconcile_providers
 from .parser import default_projects_dir, default_zcode_db
 from .report_html import render as render_html
 from .report_text import render as render_text
@@ -239,6 +239,44 @@ def cmd_backfill_provider(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_providers(args: argparse.Namespace) -> int:
+    """双信号源回填 Claude 历史 provider: msgid 指纹 + 路由时间窗."""
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print("数据库不存在. 运行 `cc-usage sync` 初始化.")
+        return 1
+    if args.only_msgid and args.only_route:
+        print("❌ --only-msgid 与 --only-route 互斥。请二选一或都不指定（双信号源）.")
+        return 2
+    prefer = args.prefer
+    if prefer not in ("strict", "msgid", "route"):
+        print(f"❌ --prefer 仅支持 strict / msgid / route，收到 {prefer!r}")
+        return 2
+    conn = connect(db_path)
+    try:
+        stats = reconcile_providers(
+            conn,
+            Path(args.projects_dir).expanduser(),
+            dry_run=args.dry_run,
+            only_msgid=args.only_msgid,
+            only_route=args.only_route,
+            prefer=prefer,
+            verbose=True,
+        )
+        print()
+        print(
+            f"扫描 {stats['scanned']} | verified={stats['verified']} "
+            f"msgid_only={stats['msgid_only']} route_only={stats['route_only']} "
+            f"conflict={stats['conflict']} (prefer={prefer} 写入 {stats['conflict_written']}) "
+            f"unmatched={stats['unmatched']} | 更新 {stats['updated']} | 跳过 {stats['skipped_tagged']}"
+        )
+        if args.dry_run:
+            print("\n(Dry-run 模式: 未写入 DB. 去掉 --dry-run 实际执行.)")
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser()
     if not db_path.exists():
@@ -366,6 +404,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="只展示回填分布，不实际写入",
     )
     sp.set_defaults(func=cmd_backfill_provider)
+
+    # reconcile-providers（双信号源）
+    sp = sub.add_parser(
+        "reconcile-providers",
+        help="双信号源回填空 provider: msgid 指纹 + 路由时间窗（VSCode log + settings.json）",
+    )
+    sp.add_argument(
+        "--projects-dir",
+        default=str(default_projects_dir()),
+        help="Claude projects 目录",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只展示决策分布和冲突，不实际写入",
+    )
+    sp.add_argument(
+        "--only-msgid",
+        action="store_true",
+        help="只用 msgid 指纹（不用路由窗），等同 backfill-provider",
+    )
+    sp.add_argument(
+        "--only-route",
+        action="store_true",
+        help="只用路由时间窗（忽略 msgid 指纹）",
+    )
+    sp.add_argument(
+        "--prefer",
+        choices=["strict", "msgid", "route"],
+        default="msgid",
+        help="冲突解决策略：strict 留空 / msgid 优先指纹（默认）/ route 优先路由",
+    )
+    sp.set_defaults(func=cmd_reconcile_providers)
 
     return p
 

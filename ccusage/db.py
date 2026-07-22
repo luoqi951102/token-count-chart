@@ -638,3 +638,373 @@ def backfill_provider(
             for (m, p), n in sorted(unmatched_seens.items(), key=lambda x: -x[1])[:10]:
                 print(f"  {m:30s}  {p:30s}  {n:6d} 条")
     return stats
+
+
+# MARK: - 路由窗提取（双信号源融合）
+#
+# VSCode Claude Code 扩展日志在每次启动时打印 ANTHROPIC_BASE_URL=...
+# 每行带 UTC timestamp，这就是机器可读的供应商切换时间线。
+# 但只覆盖 VSCode 跑过的会话；终端 Claude Code 的切换抓不到。
+# 所以再叠加 settings.json 文件 mtime 作为补充信号：
+#   每次 CCM 改 settings.json，触发的写入会更新 mtime。
+# 我们用 mtime 作为该时刻的 baseURL 切换点。
+
+import re as _re
+from datetime import datetime, timezone as _tz
+from pathlib import Path as _Path
+
+
+def _parse_utc_iso(ts: str) -> datetime | None:
+    """解析 'YYYY-MM-DDTHH:MM:SS.mmmZ' UTC ISO 字符串为 datetime."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _vclog_dir() -> _Path:
+    """VSCode Claude Code 扩展日志目录."""
+    return _Path.home() / "Library/Application Support/Code/logs"
+
+
+def _extract_route_timeline_from_vclog() -> list[tuple[datetime, str]]:
+    """扫 VSCode Claude Code 扩展日志，提取 (timestamp, baseURL) 切换点.
+
+    日志按日期分目录: YYYYMMDDTHHMMSS/window<N>/exthost/Anthropic.claude-code/Claude VSCode.log
+    每个文件内每行可能是:
+      2026-07-22T06:27:18.386Z [DEBUG] ... ANTHROPIC_BASE_URL=https://api.xxx ...
+      2026-07-22 14:27:21.133 [info] From claude: 2026-07-22T06:27:21.133Z [DEBUG] ... ANTHROPIC_BASE_URL=...
+
+    匹配 UTC ISO timestamp + ANTHROPIC_BASE_URL=https://..., 按时间排序后返回.
+    """
+    pat_url = _re.compile(r"ANTHROPIC_BASE_URL=(https?://[^\s,;\"]+)")
+    pat_utc = _re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
+
+    points: list[tuple[datetime, str]] = []
+    log_dir = _vclog_dir()
+    if not log_dir.exists():
+        return points
+
+    for log_file in log_dir.glob("*/window*/exthost/Anthropic.claude-code/Claude VSCode.log"):
+        try:
+            with open(log_file, "r", errors="ignore") as f:
+                for line in f:
+                    if "ANTHROPIC_BASE_URL=" not in line:
+                        continue
+                    m_url = pat_url.search(line)
+                    if not m_url:
+                        continue
+                    url = m_url.group(1).rstrip(",;\"'")
+                    m_ts = pat_utc.search(line)
+                    if not m_ts:
+                        continue
+                    dt = _parse_utc_iso(m_ts.group(1) + "Z")
+                    if dt is None:
+                        continue
+                    points.append((dt, url))
+        except OSError:
+            continue
+    points.sort(key=lambda x: x[0])
+    return points
+
+
+def _extract_route_timeline_from_settings() -> list[tuple[datetime, str]]:
+    """扫 ~/.claude/ 下所有 settings*.json 备份，提取 (mtime, baseURL) 切换点.
+
+    CCM 切供应商时会 rewrite settings.json, 触发 mtime 更新.
+    备份文件 (如 settings.json20260525) 是历史快照, mtime 即冻结时刻.
+    """
+    import os
+    points: list[tuple[datetime, str]] = []
+    claude_dir = _Path.home() / ".claude"
+
+    candidates = []
+    # 当前 settings.json
+    main = claude_dir / "settings.json"
+    if main.exists():
+        candidates.append(main)
+    # 备份文件: settings.json<yyyymmddHHMM> 或类似命名
+    for f in claude_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+        if name.startswith("settings.json") and name != "settings.json":
+            candidates.append(f)
+        if name == "settings.local.json":
+            candidates.append(f)
+
+    for f in candidates:
+        try:
+            url = _read_claude_base_url(f)
+            if not url:
+                continue
+            mtime = datetime.fromtimestamp(os.path.getmtime(f), tz=_tz.utc)
+            points.append((mtime, url))
+        except (OSError, ValueError):
+            continue
+    points.sort(key=lambda x: x[0])
+    return points
+
+
+def build_route_timeline(
+    extra_points: list[tuple[datetime, str]] | None = None,
+) -> list[tuple[datetime, datetime, str]]:
+    """构造路由时间窗 [(start, end, baseURL), ...].
+
+    融合 VSCode log + settings.json mtime 两源，按 timestamp 排序去重，
+    相邻同 baseURL 合并，每个时间点的结束 = 下一个时间点的开始.
+    最后一个结束 = datetime.now().
+
+    Args:
+        extra_points: 额外人工提供的切换点 (datetime, baseURL)，会与自动源合并排序
+
+    Returns:
+        时间窗列表，每个元素 (start_utc, end_utc, baseURL)
+    """
+    points: list[tuple[datetime, str]] = []
+    points += _extract_route_timeline_from_vclog()
+    points += _extract_route_timeline_from_settings()
+    if extra_points:
+        points += extra_points
+    points.sort(key=lambda x: x[0])
+
+    # 合并相邻同 baseURL
+    merged_points: list[tuple[datetime, str]] = []
+    for dt, url in points:
+        if not merged_points or merged_points[-1][1] != url:
+            merged_points.append((dt, url))
+        else:
+            # 同 baseURL, 更新时间戳到最新（避免同一供应商多次出现丢中间）
+            pass
+
+    if not merged_points:
+        return []
+
+    # 构造时间窗: [start_i, end_i) = [t_i, t_{i+1})
+    windows: list[tuple[datetime, datetime, str]] = []
+    now = datetime.now(tz=_tz.utc)
+    for i, (start, url) in enumerate(merged_points):
+        if i + 1 < len(merged_points):
+            end = merged_points[i + 1][0]
+        else:
+            end = now
+        windows.append((start, end, url))
+    return windows
+
+
+def _route_url_at(ts: datetime, windows: list[tuple[datetime, datetime, str]]) -> str:
+    """二分查找 timestamp 落在哪个路由窗，返回对应 baseURL. 落不进任何窗返回空串."""
+    import bisect
+    starts = [w[0] for w in windows]
+    idx = bisect.bisect_right(starts, ts) - 1
+    if idx < 0:
+        return ""
+    start, end, url = windows[idx]
+    if start <= ts < end:
+        return url
+    return ""
+
+
+# MARK: - 双信号源回填
+
+def reconcile_providers(
+    conn: sqlite3.Connection,
+    projects_dir: Path,
+    dry_run: bool = False,
+    only_msgid: bool = False,
+    only_route: bool = False,
+    prefer: str = "msgid",
+    verbose: bool = True,
+) -> dict:
+    """双信号源回填 Claude 历史 provider.
+
+    主信号: msg.id 格式指纹（请求级，精度高）
+    辅信号: 路由窗（VSCode log + settings.json mtime 构造）
+
+    prefer 三种模式:
+    - 'strict': 主辅一致才写；冲突留空，记入 conflicts
+    - 'msgid'  (默认): msgid 命中就用（哪怕与路由冲突），msgid 未命中才 fallback 到路由
+    - 'route':   路由命中就用，路由未命中才 fallback 到 msgid
+    only_msgid / only_route 互斥单信号模式，prefer 失效
+    """
+    stats = {
+        "scanned": 0,
+        "verified": 0,            # 主辅一致
+        "msgid_only": 0,          # 仅 msgid 命中
+        "route_only": 0,          # 仅路由窗命中
+        "conflict": 0,            # 主辅冲突总数
+        "conflict_written": 0,    # prefer=msgid/route 时冲突仍写入的数量
+        "unmatched": 0,           # 都没命中
+        "updated": 0,             # 实际写入 DB 的行
+        "skipped_tagged": 0,      # DB 已有 provider 非空
+        "prefer": prefer,
+        "dry_run": dry_run,
+    }
+
+    # 1) 构造路由窗
+    windows = build_route_timeline()
+    windows_summary = [(w[0].isoformat(), w[1].isoformat(), w[2]) for w in windows]
+    stats["route_windows"] = windows_summary
+    if verbose:
+        print(f"=== 路由时间窗（共 {len(windows)} 个，prefer = {prefer}）===")
+        for s, e, u in windows:
+            print(f"  {s.strftime('%Y-%m-%d %H:%M UTC')} ~ {e.strftime('%Y-%m-%d %H:%M UTC')}  →  {u}")
+        print()
+
+    # 2) 扫 JSONL 提取 (timestamp, model, msgid)
+    import json
+    msgid_index: dict[str, tuple[str, str]] = {}  # ts -> (model, msgid)
+    projects_path = Path(projects_dir)
+    if not projects_path.exists():
+        if verbose:
+            print(f"⚠️  Claude projects 目录不存在: {projects_path}")
+        return stats
+
+    for project_dir in sorted(projects_path.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        for f in sorted(project_dir.glob("*.jsonl")):
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    for line in fp:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(d, dict) or d.get("type") != "assistant":
+                            continue
+                        msg = d.get("message")
+                        if not isinstance(msg, dict):
+                            continue
+                        model = msg.get("model") or ""
+                        if not model or model in {"<synthetic>", ""}:
+                            continue
+                        ts = d.get("timestamp", "")
+                        if not ts:
+                            continue
+                        mid = msg.get("id", "")
+                        stats["scanned"] += 1
+                        msgid_index[ts] = (model, mid)
+            except OSError:
+                continue
+
+    if verbose:
+        print(f"扫描 JSONL {stats['scanned']} 条 assistant 行\n")
+
+    # 3) 双信号源决策
+    conflicts: list[tuple[str, str, str, str]] = []  # (ts, model, msgid_url, route_url)
+    write_plan: list[tuple[str, str, str]] = []        # (ts, url_to_write, decision_tag)
+
+    for ts, (model, mid) in msgid_index.items():
+        ts_dt = _parse_utc_iso(ts)
+        if ts_dt is None:
+            continue
+        msgid_url = "" if only_route else _classify_provider_from_msgid(mid, model)
+        route_url = "" if only_msgid else _route_url_at(ts_dt, windows)
+
+        # 单信号模式
+        if only_msgid:
+            if msgid_url:
+                stats["msgid_only"] += 1
+                write_plan.append((ts, msgid_url, "msgid_only"))
+            else:
+                stats["unmatched"] += 1
+            continue
+        if only_route:
+            if route_url:
+                stats["route_only"] += 1
+                write_plan.append((ts, route_url, "route_only"))
+            else:
+                stats["unmatched"] += 1
+            continue
+
+        # 双信号源决策
+        if msgid_url and route_url and msgid_url == route_url:
+            stats["verified"] += 1
+            write_plan.append((ts, msgid_url, "verified"))
+        elif msgid_url and route_url and msgid_url != route_url:
+            stats["conflict"] += 1
+            conflicts.append((ts, model, msgid_url, route_url))
+            if prefer == "msgid":
+                write_plan.append((ts, msgid_url, "conflict_prefer_msgid"))
+                stats["conflict_written"] += 1
+            elif prefer == "route":
+                write_plan.append((ts, route_url, "conflict_prefer_route"))
+                stats["conflict_written"] += 1
+            # strict 模式不写
+        elif msgid_url and not route_url:
+            stats["msgid_only"] += 1
+            write_plan.append((ts, msgid_url, "msgid_only"))
+        elif route_url and not msgid_url:
+            stats["route_only"] += 1
+            write_plan.append((ts, route_url, "route_only"))
+        else:
+            stats["unmatched"] += 1
+
+    # 4) 生成 dry-run 报告或写库
+    if dry_run:
+        write_dist: dict[tuple[str, str], int] = {}
+        for ts, url, tag in write_plan:
+            m = msgid_index[ts][0]
+            write_dist[(m, tag)] = write_dist.get((m, tag), 0) + 1
+        if verbose:
+            print("=== 决策分布 ===")
+            print(f"  verified (主辅一致)        : {stats['verified']}   ✅ 写入")
+            print(f"  msgid_only (仅指纹命中)    : {stats['msgid_only']}   ✅ 写入")
+            print(f"  route_only (仅路由命中)    : {stats['route_only']}   ✅ 写入")
+            print(f"  conflict (主辅冲突)        : {stats['conflict']}")
+            print(f"    ↳ prefer={prefer} 写入   : {stats['conflict_written']}   {'✅' if stats['conflict_written'] else '❌'}")
+            print(f"  unmatched (都未命中)       : {stats['unmatched']}   ❌ 留空")
+            print()
+            print("=== 将要写入的 (model, decision) 分布 ===")
+            for (m, t), n in sorted(write_dist.items(), key=lambda x: (-x[1], x[0])):
+                print(f"  {m:30s}  {t:22s}  {n:6d}")
+            print()
+            if conflicts:
+                from collections import Counter as _C
+                conflict_by_model = _C()
+                for ts, m, mu, ru in conflicts:
+                    conflict_by_model[(m, mu, ru)] += 1
+                print(f"=== 冲突聚合（按 model+msgid_url+route_url，共 {len(conflicts)} 条）===")
+                for (m, mu, ru), n in sorted(conflict_by_model.items(), key=lambda x: -x[1])[:25]:
+                    if prefer == "msgid": chosen = mu
+                    elif prefer == "route": chosen = ru
+                    else: chosen = "<skip>"
+                    print(f"  {m:22s}  msgid={mu:48s} route={ru:48s}  n={n:5d}  → 写 {chosen}")
+                print()
+            print("(Dry-run 模式: 未写入 DB. 去掉 --dry-run 实际执行)")
+        return stats
+
+    # 实际写入
+    cur = conn.cursor()
+    for ts, url, _tag in write_plan:
+        row = cur.execute(
+            "SELECT rowid FROM usage WHERE source='claude' AND timestamp=? AND provider=''",
+            (ts,),
+        ).fetchone()
+        if row is None:
+            stats["skipped_tagged"] += 1
+            continue
+        cur.execute(
+            "UPDATE usage SET provider=? WHERE source='claude' AND timestamp=? AND provider=''",
+            (url, ts),
+        )
+        stats["updated"] += cur.rowcount
+    conn.commit()
+
+    if verbose:
+        print(f"\n✓ 已更新 {stats['updated']} 行空 provider Claude 行")
+        print(f"  跳过（已带标签或不在 DB）: {stats['skipped_tagged']}")
+        print(f"  决策明细: verified={stats['verified']} msgid_only={stats['msgid_only']} "
+              f"route_only={stats['route_only']} conflict={stats['conflict']} "
+              f"(prefer={prefer} 写入 {stats['conflict_written']}) unmatched={stats['unmatched']}")
+        if conflicts and prefer == "strict":
+            print(f"\n⚠️  {len(conflicts)} 条主辅冲突未写入（strict 模式保留空）:")
+            for ts, m, mu, ru in conflicts[:30]:
+                print(f"  {ts}  {m:22s}  msgid→{mu}  vs  route→{ru}")
+            if len(conflicts) > 30:
+                print(f"  ... 还有 {len(conflicts) - 30} 条")
+    return stats
