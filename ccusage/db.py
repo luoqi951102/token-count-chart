@@ -1008,3 +1008,124 @@ def reconcile_providers(
             if len(conflicts) > 30:
                 print(f"  ... 还有 {len(conflicts) - 30} 条")
     return stats
+
+
+# MARK: - 去重（修复历史多次 sync 累积的重复行）
+
+def dedupe_claude_rows(
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """去掉 usage 表里 Claude 同 (source_file, timestamp) 的重复行.
+
+    背景: 早期 sync 在某些 force=True 路径里 DELETE+INSERT 不对称,
+    导致同一 assistant 行被入库 2-8 次。token 数被相应放大，
+    会让浮窗"今日总量"等指标虚高。
+
+    策略: 保留每个 (source_file, timestamp) 的最小 rowid 行（最早插入的那条）,
+          其余 Claude 重复行删除. ZCode 走 (source, ext_id) UNIQUE 索引, 无重复, 不动.
+
+    返回:
+    {
+      before_rows, after_rows, deleted_rows,
+      before_total_tokens, after_total_tokens,
+      dup_groups_by_count: {2: N, 3: N, ...}
+    }
+    """
+    stats = {
+        "before_rows": 0,
+        "after_rows": 0,
+        "deleted_rows": 0,
+        "before_total_tokens": 0,
+        "after_total_tokens": 0,
+        "dry_run": dry_run,
+        "dup_groups_by_count": {},
+    }
+
+    cur = conn.cursor()
+
+    # 1) 当前总量
+    stats["before_rows"] = cur.execute(
+        "SELECT COUNT(*) FROM usage WHERE source='claude'"
+    ).fetchone()[0]
+    stats["before_total_tokens"] = cur.execute(
+        "SELECT COALESCE(SUM(total_context + output_tokens), 0) FROM usage"
+    ).fetchone()[0]
+
+    # 2) 重复倍率分布
+    rows = cur.execute("""
+        SELECT n, COUNT(*) AS groups FROM (
+          SELECT COUNT(*) AS n FROM usage WHERE source='claude'
+          GROUP BY source_file, timestamp
+        ) GROUP BY n ORDER BY n
+    """).fetchall()
+    stats["dup_groups_by_count"] = {n: g for n, g in rows}
+
+    # 3) 待删除行数（仅模拟）
+    to_delete = cur.execute("""
+        SELECT COUNT(*) FROM usage
+        WHERE source='claude' AND rowid NOT IN (
+          SELECT MIN(rowid) FROM usage WHERE source='claude'
+          GROUP BY source_file, timestamp
+        )
+    """).fetchone()[0]
+    stats["deleted_rows"] = to_delete
+
+    if verbose:
+        print(f"=== Claude 重复倍率分布 ===")
+        total_dup_groups = sum(g for n, g in rows if n > 1)
+        for n, g in rows:
+            mark = "❌ 重复" if n > 1 else "✓ 唯一"
+            print(f"  倍率 n={n}: {g:6d} 组  {mark}")
+        print(f"  (其中 {total_dup_groups} 组有重复，总重复行约 {to_delete:,d})")
+        print()
+        print(f"=== 修复影响 ===")
+        print(f"  Claude 行数         : {stats['before_rows']:,d} -> {stats['before_rows'] - to_delete:,d}")
+        print(f"  待删除（重复）     : {to_delete:,d}")
+        print(f"  总 token (全表)   : {stats['before_total_tokens']:,d} ({stats['before_total_tokens']/1e9:.3f}B)")
+
+    if dry_run:
+        # 模拟去重后的 token 数
+        after_total = cur.execute("""
+            SELECT COALESCE(SUM(total_context + output_tokens), 0) FROM usage
+            WHERE (source='claude' AND rowid IN (
+                    SELECT MIN(rowid) FROM usage WHERE source='claude'
+                    GROUP BY source_file, timestamp
+                  )) OR source != 'claude'
+        """).fetchone()[0]
+        stats["after_total_tokens"] = after_total
+        stats["after_rows"] = stats["before_rows"] - to_delete
+        if verbose:
+            print(f"  去重后 token      : {after_total:,d} ({after_total/1e9:.3f}B)")
+            print(f"  (Dry-run 模式: 未删除. 去掉 --dry-run 实际执行)")
+        return stats
+
+    # 4) 实际去重：DELETE 重复行（保留最小 rowid）
+    # 用临时表收集最小 rowid，再 DELETE 不在其中的行
+    cur.execute("""
+        CREATE TEMP TABLE IF NOT EXISTS _keep_rowids AS
+        SELECT MIN(rowid) AS rid FROM usage WHERE source='claude'
+        GROUP BY source_file, timestamp
+    """)
+    deleted = cur.execute("""
+        DELETE FROM usage WHERE source='claude' AND rowid NOT IN (SELECT rid FROM _keep_rowids)
+    """).rowcount
+    cur.execute("DROP TABLE _keep_rowids")
+    conn.commit()
+
+    # 5) 修复后统计
+    stats["after_rows"] = cur.execute(
+        "SELECT COUNT(*) FROM usage WHERE source='claude'"
+    ).fetchone()[0]
+    stats["after_total_tokens"] = cur.execute(
+        "SELECT COALESCE(SUM(total_context + output_tokens), 0) FROM usage"
+    ).fetchone()[0]
+    stats["deleted_rows"] = deleted
+
+    if verbose:
+        print(f"\n✓ 已删除 {deleted:,d} 行重复 Claude 行")
+        print(f"  Claude 行数       : {stats['before_rows']:,d} → {stats['after_rows']:,d}")
+        print(f"  总 token (全表) : {stats['before_total_tokens']:,d} → {stats['after_total_tokens']:,d}")
+        print(f"                   ({stats['before_total_tokens']/1e9:.3f}B → {stats['after_total_tokens']/1e9:.3f}B)")
+    return stats

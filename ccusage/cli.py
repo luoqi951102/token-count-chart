@@ -21,7 +21,7 @@ from .aggregate import (
     now_in_sh,
     date_range_span,
 )
-from .db import connect, sync, sync_zcode, get_meta, backfill_provider, reconcile_providers
+from .db import connect, sync, sync_zcode, get_meta, backfill_provider, reconcile_providers, dedupe_claude_rows
 from .parser import default_projects_dir, default_zcode_db
 from .report_html import render as render_html
 from .report_text import render as render_text
@@ -277,6 +277,22 @@ def cmd_reconcile_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dedupe(args: argparse.Namespace) -> int:
+    """去掉 usage 表里 Claude 同 (source_file, timestamp) 的重复行."""
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print("数据库不存在. 运行 `cc-usage sync` 初始化.")
+        return 1
+    conn = connect(db_path)
+    try:
+        stats = dedupe_claude_rows(conn, dry_run=args.dry_run, verbose=True)
+        if args.dry_run:
+            print("\n(Dry-run 模式: 未写入. 去掉 --dry-run 实际执行)")
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser()
     if not db_path.exists():
@@ -437,6 +453,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="冲突解决策略：strict 留空 / msgid 优先指纹（默认）/ route 优先路由",
     )
     sp.set_defaults(func=cmd_reconcile_providers)
+
+    # dedupe（修复历史重复行）
+    sp = sub.add_parser(
+        "dedupe",
+        help="去掉 Claude 同 (source_file, timestamp) 的重复行（修复历史多次 sync 累积的翻倍）",
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只展示重复分布和修复后总量，不实际删除",
+    )
+    sp.set_defaults(func=cmd_dedupe)
 
     return p
 
